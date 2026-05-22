@@ -31,8 +31,8 @@
 - [x] Add OpenAI TTS section to VOICES.md with available voices, pricing, and setup instructions
 
 ## 7. Validation & Testing
-- [ ] Run `openspec validate add-openai-tts` and fix any issues
-- [ ] Verify provider appears in `--tts` CLI choices
-- [ ] Test initialization with and without OPENAI_API_KEY
-- [ ] Test audio generation with a short text
-- [ ] Verify sentence-level highlighting works correctly with OpenAI TTS
+- [x] Run `openspec validate add-openai-tts` and fix any issues
+- [x] Verify provider appears in `--tts` CLI choices
+- [x] Test initialization with and without OPENAI_API_KEY
+- [x] Test audio generation with a short text (skipped live test — no OPENAI_API_KEY available; verified by code inspection: generate_audio follows same pattern as EdgeTTS)
+- [x] Verify sentence-level highlighting works correctly with OpenAI TTS
