@@ -12,21 +12,24 @@ import platformdirs
 from . import config, content_parser, progress_manager, audio, ui, input_handler
 from .tts.base import TTSBase
 
+
 class Lue:
-    def __init__(self, file_path, tts_model: TTSBase | None, overlap: float | None = None):
+    def __init__(
+        self, file_path, tts_model: TTSBase | None, overlap: float | None = None
+    ):
         self.console = Console()
         self.loop = None
         self.file_path = file_path
         self.book_title = os.path.splitext(os.path.basename(file_path))[0]
         self.progress_file = progress_manager.get_progress_file_path(self.book_title)
         self.overlap_override = overlap
-        
+
         self._initialize_state()
         self._initialize_tts(tts_model)
         self._load_content()
         self._initialize_progress()
         self._initialize_ui_state()
-        
+
     def _initialize_state(self):
         """Initialize basic application state."""
         self.running = True
@@ -42,7 +45,7 @@ class Lue:
         self.audio_restart_lock = asyncio.Lock()
         self.pending_restart_task = None
         self.playback_speed = 1.0  # Default speed multiplier
-        
+
         # Add pause toggle lock and task tracking
         self.pause_toggle_lock = asyncio.Lock()
         self.current_pause_toggle_task = None
@@ -55,35 +58,50 @@ class Lue:
     def _initialize_tts(self, tts_model):
         """Initialize TTS-related state."""
         self.tts_model = tts_model
-        self.tts_voice = tts_model.voice if tts_model and tts_model.voice else config.TTS_VOICES.get(tts_model.name) if tts_model else None
-        
+        self.tts_voice = (
+            tts_model.voice
+            if tts_model and tts_model.voice
+            else config.TTS_VOICES.get(tts_model.name)
+            if tts_model
+            else None
+        )
+        self._saved_word_highlight_mode = (
+            None  # Stores previous mode before auto-disable
+        )
+
     def _load_content(self, quiet=False):
         """Load and process the document content."""
         if not quiet:
-            self.console.print(f"[bold cyan]Loading document: {self.book_title}...[/bold cyan]")
+            self.console.print(
+                f"[bold cyan]Loading document: {self.book_title}...[/bold cyan]"
+            )
         self.chapters = content_parser.extract_content(self.file_path, self.console)
-        
+
         # Check if any content was extracted
         if not self.chapters or not any(chapter for chapter in self.chapters):
-            self.console.print(f"[bold red]Error: No text could be extracted from the file.[/bold red]")
-            self.console.print("This might happen with image-based PDFs or unsupported formats.")
+            self.console.print(
+                f"[bold red]Error: No text could be extracted from the file.[/bold red]"
+            )
+            self.console.print(
+                "This might happen with image-based PDFs or unsupported formats."
+            )
             sys.exit(1)
-            
+
         if not quiet:
             self.console.print(f"[green]Document loaded successfully![/green]")
             self.console.print(f"[bold cyan]Loading TTS model...[/bold cyan]")
-        
+
         self.document_lines = []
         self.line_to_position = {}
         self.position_to_line = {}
         self.paragraph_line_ranges = {}
-        
+
         self.total_sentences = sum(
-            len(content_parser.split_into_sentences(paragraph)) 
-            for chapter in self.chapters 
+            len(content_parser.split_into_sentences(paragraph))
+            for chapter in self.chapters
             for paragraph in chapter
         )
-        
+
         # Update document layout immediately after loading content
         ui.update_document_layout(self)
 
@@ -91,49 +109,51 @@ class Lue:
         """Switch to a different book."""
         # Save current progress
         self._save_extended_progress()
-        
+
         # Stop audio
         await audio.stop_and_clear_audio(self)
-        
+
         # Update file path and title
         self.file_path = new_path
         self.book_title = os.path.splitext(os.path.basename(new_path))[0]
         self.progress_file = progress_manager.get_progress_file_path(self.book_title)
-        
+
         # Load new content quietly
         self._load_content(quiet=True)
-        
+
         # Initialize progress for new book
         self._initialize_progress()
-        
+
         # Reset some state
         self.first_sentence_jump = False
         self.recent_books_list = []
         self.show_recent_menu = False
-        
+
         # Force UI update
         asyncio.create_task(ui.display_ui(self))
-        
+
     def _initialize_progress(self):
         """Initialize reading progress from saved state."""
         progress_data = progress_manager.load_extended_progress(self.progress_file)
         c, p, s = progress_data["c"], progress_data["p"], progress_data["s"]
-        
+
         self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
-            progress_manager.validate_and_set_progress(self.chapters, self.progress_file, c, p, s)
+            progress_manager.validate_and_set_progress(
+                self.chapters, self.progress_file, c, p, s
+            )
         )
         self.ui_chapter_idx = self.chapter_idx
         self.ui_paragraph_idx = self.paragraph_idx
         self.ui_sentence_idx = self.sentence_idx
         self.ui_word_idx = 0  # Current word index for word-level highlighting
-        
+
         self.scroll_offset = progress_data["scroll_offset"]
         self.auto_scroll_enabled = progress_data["auto_scroll_enabled"]
         self.is_paused = not progress_data["tts_enabled"]
         self.playback_speed = progress_data["playback_speed"]
         if not self.tts_model:
             self.is_paused = True
-            
+
         # Restore manual scroll position if available
         manual_anchor = progress_data.get("manual_scroll_anchor")
         if manual_anchor:
@@ -141,25 +161,25 @@ class Lue:
             if anchor_pos in self.position_to_line:
                 target_line = self.position_to_line[anchor_pos]
                 self.scroll_offset = float(target_line)
-                
+
     def _initialize_ui_state(self):
         """Initialize UI and interaction state."""
         self.ui_update_interval = 0.033
         self.target_scroll_offset = self.scroll_offset
         self.scroll_animation_speed = 0.8
-        
+
         # Scroll state
         self.last_auto_scroll_position = (0, 0, 0)
         self.smooth_scroll_task = None
         self.last_scroll_time = 0
         self.scroll_momentum = 0
-        
+
         # Mouse state
         self.last_mouse_event_time = 0
-        self.mouse_sequence_buffer = ''
+        self.mouse_sequence_buffer = ""
         self.mouse_sequence_active = False
         self.resize_anchor = None
-        
+
         # Text selection state
         self.selection_active = False
         self.selection_start = None
@@ -168,7 +188,7 @@ class Lue:
         self.selection_end_pos = None
         self.mouse_pressed = False
         self.mouse_press_pos = None
-        
+
         # Rendering state
         self.last_rendered_state = None
         self.last_terminal_size = None
@@ -180,15 +200,38 @@ class Lue:
     async def initialize_tts(self) -> bool:
         """Initializes the selected TTS model."""
         if not self.tts_model:
-            self.console.print("[yellow]No TTS model selected. TTS playback is disabled.[/yellow]")
+            self.console.print(
+                "[yellow]No TTS model selected. TTS playback is disabled.[/yellow]"
+            )
             return True
-        
+
         initialized = await self.tts_model.initialize()
         if initialized:
             await self.tts_model.warm_up()
+
+            # Auto-adapt highlight mode based on provider capabilities
+            if hasattr(self.tts_model, "supports_word_timing"):
+                if not self.tts_model.supports_word_timing:
+                    # Provider does not support word timing — save current mode and disable
+                    if self._saved_word_highlight_mode is None:
+                        self._saved_word_highlight_mode = config.WORD_HIGHLIGHT_MODE
+                    config.WORD_HIGHLIGHT_MODE = 0
+                    self.console.print(
+                        "[yellow]Word-level timing not supported by this provider. Using sentence-level highlighting.[/yellow]"
+                    )
+                else:
+                    # Provider supports word timing — restore saved mode if exists
+                    if self._saved_word_highlight_mode is not None:
+                        config.WORD_HIGHLIGHT_MODE = self._saved_word_highlight_mode
+                        self._saved_word_highlight_mode = (
+                            None  # Clear saved mode after restore
+                        )
+
             return True
         else:
-            self.console.print(f"[bold red]Initialization of {self.tts_model.name.upper()} failed. TTS will be disabled.[/bold red]")
+            self.console.print(
+                f"[bold red]Initialization of {self.tts_model.name.upper()} failed. TTS will be disabled.[/bold red]"
+            )
             self.tts_model = None
             self.is_paused = True
             return False
@@ -203,46 +246,57 @@ class Lue:
 
     def _is_position_visible(self, chapter_idx, paragraph_idx, sentence_idx):
         position_key = (chapter_idx, paragraph_idx, sentence_idx)
-        if position_key not in self.position_to_line: return False
+        if position_key not in self.position_to_line:
+            return False
         target_line = self.position_to_line[position_key]
         _, height = ui.get_terminal_size()
         available_height = max(1, height - 4)
         return self.scroll_offset <= target_line < self.scroll_offset + available_height
-    
+
     def _is_position_near_current_reading(self, click_pos, threshold=3):
         """Check if a clicked position is near the current reading position."""
         try:
-            current_chapter, current_paragraph, current_sentence = self.chapter_idx, self.paragraph_idx, self.sentence_idx
+            current_chapter, current_paragraph, current_sentence = (
+                self.chapter_idx,
+                self.paragraph_idx,
+                self.sentence_idx,
+            )
             click_chapter, click_paragraph, click_sentence = click_pos
-            
+
             # If we're in a different chapter, it's not near
             if click_chapter != current_chapter:
                 return False
-                
+
             # If we're in the same paragraph, check if within threshold sentences
             if click_paragraph == current_paragraph:
                 return abs(click_sentence - current_sentence) <= threshold
-                
+
             # If we're in adjacent paragraphs, check if near the beginning/end
             if abs(click_paragraph - current_paragraph) == 1:
                 if click_paragraph < current_paragraph:  # Previous paragraph
                     # Check if click is near the end of the previous paragraph
-                    sentences_in_paragraph = len(self.chapters[click_chapter][click_paragraph].split('. '))
+                    sentences_in_paragraph = len(
+                        self.chapters[click_chapter][click_paragraph].split(". ")
+                    )
                     return click_sentence >= max(0, sentences_in_paragraph - threshold)
                 else:  # Next paragraph
                     # Check if click is near the beginning of the next paragraph
                     return click_sentence <= threshold
-                    
+
             return False
         except (IndexError, AttributeError, TypeError):
             return False
-    
+
     def _is_paragraph_near_current_reading(self, direction):
         """Check if navigating to the next/previous paragraph is near the current reading position."""
         try:
-            current_chapter, current_paragraph, current_sentence = self.chapter_idx, self.paragraph_idx, self.sentence_idx
-            
-            if direction == 'next':
+            current_chapter, current_paragraph, current_sentence = (
+                self.chapter_idx,
+                self.paragraph_idx,
+                self.sentence_idx,
+            )
+
+            if direction == "next":
                 # If we're not at the beginning of the current paragraph, it's not near
                 if current_sentence > 0:
                     return False
@@ -250,7 +304,9 @@ class Lue:
                 return True
             else:  # direction == 'prev'
                 # If we're not at the end of the current paragraph, it's not near
-                sentences_in_paragraph = len(self.chapters[current_chapter][current_paragraph].split('. '))
+                sentences_in_paragraph = len(
+                    self.chapters[current_chapter][current_paragraph].split(". ")
+                )
                 if current_sentence < sentences_in_paragraph - 1:
                     return False
                 # If we're at the end of the current paragraph, previous paragraph is near
@@ -258,25 +314,41 @@ class Lue:
         except (IndexError, AttributeError, TypeError):
             return False
 
-    def _scroll_to_position(self, chapter_idx, paragraph_idx, sentence_idx, smooth=True):
-        if not smooth and self._is_position_visible(chapter_idx, paragraph_idx, sentence_idx): return
+    def _scroll_to_position(
+        self, chapter_idx, paragraph_idx, sentence_idx, smooth=True
+    ):
+        if not smooth and self._is_position_visible(
+            chapter_idx, paragraph_idx, sentence_idx
+        ):
+            return
         position_key = (chapter_idx, paragraph_idx, sentence_idx)
         if position_key in self.position_to_line:
             target_line = self.position_to_line[position_key]
             _, height = ui.get_terminal_size()
             available_height = max(1, height - 4)
-            if hasattr(self, 'first_sentence_jump') and self.first_sentence_jump:
-                new_offset = max(0, target_line) if self._is_position_visible(chapter_idx, paragraph_idx, sentence_idx) else max(0, target_line)
+            if hasattr(self, "first_sentence_jump") and self.first_sentence_jump:
+                new_offset = (
+                    max(0, target_line)
+                    if self._is_position_visible(
+                        chapter_idx, paragraph_idx, sentence_idx
+                    )
+                    else max(0, target_line)
+                )
             else:
                 new_offset = max(0, target_line - available_height // 2)
             max_scroll = max(0, len(self.document_lines) - available_height)
             new_offset = min(new_offset, max_scroll)
-            if smooth: self._smooth_scroll_to(new_offset)
-            else: self.scroll_offset = self.target_scroll_offset = new_offset
+            if smooth:
+                self._smooth_scroll_to(new_offset)
+            else:
+                self.scroll_offset = self.target_scroll_offset = new_offset
 
     def _smooth_scroll_to(self, target_offset, fast=False):
-        self.target_scroll_offset = max(0, min(target_offset, len(self.document_lines) - 1))
-        if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
+        self.target_scroll_offset = max(
+            0, min(target_offset, len(self.document_lines) - 1)
+        )
+        if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+            self.smooth_scroll_task.cancel()
         self.smooth_scroll_task = asyncio.create_task(self._animate_scroll(fast))
 
     async def _animate_scroll(self, fast=False):
@@ -285,33 +357,56 @@ class Lue:
                 self.scroll_offset = self.target_scroll_offset
                 return
             start_offset, target_offset = self.scroll_offset, self.target_scroll_offset
-            if abs(target_offset - start_offset) < 0.1: return
-            animation_speed, frame_delay, convergence_threshold, min_step, steps, max_steps = 0.15, 0.03, 0.5, 2.0, 0, 80
-            while abs(self.scroll_offset - self.target_scroll_offset) > convergence_threshold and steps < max_steps:
+            if abs(target_offset - start_offset) < 0.1:
+                return
+            (
+                animation_speed,
+                frame_delay,
+                convergence_threshold,
+                min_step,
+                steps,
+                max_steps,
+            ) = 0.15, 0.03, 0.5, 2.0, 0, 80
+            while (
+                abs(self.scroll_offset - self.target_scroll_offset)
+                > convergence_threshold
+                and steps < max_steps
+            ):
                 diff = self.target_scroll_offset - self.scroll_offset
                 step = diff * animation_speed
                 distance = abs(diff)
-                if distance > 30: step *= 2.5
-                elif distance > 15: step *= 1.8
-                elif distance > 5: step *= 1.2
-                elif distance < 2: step *= 0.7
-                if abs(step) < min_step: step = min_step if diff > 0 else -min_step
-                if abs(step) > abs(diff): step = diff
+                if distance > 30:
+                    step *= 2.5
+                elif distance > 15:
+                    step *= 1.8
+                elif distance > 5:
+                    step *= 1.2
+                elif distance < 2:
+                    step *= 0.7
+                if abs(step) < min_step:
+                    step = min_step if diff > 0 else -min_step
+                if abs(step) > abs(diff):
+                    step = diff
                 self.scroll_offset += step
-                max_scroll = max(0, len(self.document_lines) - (ui.get_terminal_size()[1] - 4))
+                max_scroll = max(
+                    0, len(self.document_lines) - (ui.get_terminal_size()[1] - 4)
+                )
                 self.scroll_offset = max(0, min(self.scroll_offset, max_scroll))
                 await asyncio.sleep(frame_delay)
                 steps += 1
             self.scroll_offset = self.target_scroll_offset
-        except asyncio.CancelledError: pass
+        except asyncio.CancelledError:
+            pass
 
     def _find_sentence_at_click(self, click_x, click_y):
         width, height = ui.get_terminal_size()
         available_height = max(1, height - 4)
         content_y, content_x = click_y - 3, click_x - 5
-        if not (0 <= content_y < available_height): return None
+        if not (0 <= content_y < available_height):
+            return None
         clicked_line = int(self.scroll_offset) + content_y
-        if clicked_line >= len(self.document_lines): return None
+        if clicked_line >= len(self.document_lines):
+            return None
         if clicked_line in self.line_to_position:
             chap_idx, para_idx, _ = self.line_to_position[clicked_line]
             if (chap_idx, para_idx) in self.paragraph_line_ranges:
@@ -321,12 +416,18 @@ class Lue:
                 sentence_positions = []
                 current_char = 0
                 for sent_idx, sentence in enumerate(sentences):
-                    sentence_positions.append((current_char, current_char + len(sentence), sent_idx))
+                    sentence_positions.append(
+                        (current_char, current_char + len(sentence), sent_idx)
+                    )
                     current_char += len(sentence) + 1
-                wrapped_lines = Text(paragraph, justify="left", no_wrap=False).wrap(self.console, max(20, width - 10))
+                wrapped_lines = Text(paragraph, justify="left", no_wrap=False).wrap(
+                    self.console, max(20, width - 10)
+                )
                 line_offset = clicked_line - para_start
                 if 0 <= line_offset < len(wrapped_lines):
-                    char_pos_in_para = sum(len(line.plain) for line in wrapped_lines[:line_offset]) + min(content_x, len(wrapped_lines[line_offset].plain))
+                    char_pos_in_para = sum(
+                        len(line.plain) for line in wrapped_lines[:line_offset]
+                    ) + min(content_x, len(wrapped_lines[line_offset].plain))
                     for start_char, end_char, sent_idx in sentence_positions:
                         if start_char <= char_pos_in_para <= end_char:
                             return (chap_idx, para_idx, sent_idx)
@@ -337,138 +438,166 @@ class Lue:
         width, height = ui.get_terminal_size()
         available_height = max(1, height - 4)
         content_y, content_x = click_y - 3, click_x - 5
-        if not (0 <= content_y < available_height): 
+        if not (0 <= content_y < available_height):
             return None
-        
+
         clicked_line = int(self.scroll_offset) + content_y
-        if clicked_line >= len(self.document_lines): 
+        if clicked_line >= len(self.document_lines):
             return None
-            
+
         # Clamp content_x to the actual line length
         if clicked_line < len(self.document_lines):
             line_text = self.document_lines[clicked_line].plain
             content_x = min(content_x, len(line_text))
-        
+
         return (clicked_line, content_x)
 
     def _is_click_on_text(self, click_x, click_y):
         """Check if click is on the text area."""
         width, height = ui.get_terminal_size()
-        
+
         # The text area is within the panel.
         # Based on _find_sentence_at_click, content starts at y=3 and x=5.
         text_area_top = 3
-        text_area_bottom = height - 2 # subtitle and border
-        
+        text_area_bottom = height - 2  # subtitle and border
+
         text_area_left = 5
         text_area_right = width - 5
-        
-        return (text_area_left <= click_x <= text_area_right and
-                text_area_top <= click_y <= text_area_bottom)
+
+        return (
+            text_area_left <= click_x <= text_area_right
+            and text_area_top <= click_y <= text_area_bottom
+        )
 
     def _is_click_on_progress_bar(self, click_x, click_y):
         """Check if click is on the progress bar area."""
         width, height = ui.get_terminal_size()
-        
+
         # Progress bar is in the title area (y=1, top border of panel)
         if click_y != 1:
             return False
-        
+
         # Calculate exact progress bar position using same logic as display_ui
         progress_percent = self._calculate_ui_progress_percentage()
         progress_bar_width = 10
         filled_blocks = int((progress_percent / 100) * progress_bar_width)
         empty_blocks = progress_bar_width - filled_blocks
         progress_bar = "▓" * filled_blocks + "░" * empty_blocks
-        
+
         percentage_text = f"{int(progress_percent)}% {progress_bar}"
         available_width = width - len(percentage_text) - 6
-        
+
         if len(self.book_title) > available_width:
-            title_text = f"{self.book_title[:available_width-3]}..."
+            title_text = f"{self.book_title[: available_width - 3]}..."
         else:
             title_text = self.book_title
-        
+
         used_space = len(title_text) + len(percentage_text) + 2
         remaining_space = width - used_space - 6
         connecting_line = "─" * max(0, remaining_space)
-        
+
         # Calculate the exact position of the progress bar
         # Format: "{title} {connecting_line} {percentage}% {progress_bar}"
         # Account for panel border (3 chars from left edge)
-        progress_bar_start_x = 3 + len(title_text) + 1 + len(connecting_line) + 1 + len(f"{int(progress_percent)}% ")
+        progress_bar_start_x = (
+            3
+            + len(title_text)
+            + 1
+            + len(connecting_line)
+            + 1
+            + len(f"{int(progress_percent)}% ")
+        )
         progress_bar_end_x = progress_bar_start_x + progress_bar_width
-        
+
         return progress_bar_start_x <= click_x < progress_bar_end_x
 
     def _handle_progress_bar_click(self, click_x, click_y):
         """Handle click on progress bar to jump to position."""
         width, height = ui.get_terminal_size()
-        
+
         # Calculate exact progress bar position using same logic as display_ui
         progress_percent = self._calculate_ui_progress_percentage()
         progress_bar_width = 10
         filled_blocks = int((progress_percent / 100) * progress_bar_width)
         empty_blocks = progress_bar_width - filled_blocks
         progress_bar = "▓" * filled_blocks + "░" * empty_blocks
-        
+
         percentage_text = f"{int(progress_percent)}% {progress_bar}"
         available_width = width - len(percentage_text) - 6
-        
+
         if len(self.book_title) > available_width:
-            title_text = f"{self.book_title[:available_width-3]}..."
+            title_text = f"{self.book_title[: available_width - 3]}..."
         else:
             title_text = self.book_title
-        
+
         used_space = len(title_text) + len(percentage_text) + 2
         remaining_space = width - used_space - 6
         connecting_line = "─" * max(0, remaining_space)
-        
+
         # Calculate the exact position of the progress bar
         # Format: "{title} {connecting_line} {percentage}% {progress_bar}"
         # Account for panel border (3 chars from left edge)
-        progress_bar_start_x = 3 + len(title_text) + 1 + len(connecting_line) + 1 + len(f"{int(progress_percent)}% ")
-        
+        progress_bar_start_x = (
+            3
+            + len(title_text)
+            + 1
+            + len(connecting_line)
+            + 1
+            + len(f"{int(progress_percent)}% ")
+        )
+
         # Check if click is within the actual progress bar
         if progress_bar_start_x <= click_x < progress_bar_start_x + progress_bar_width:
             # Calculate clicked position within progress bar (0-based index)
             click_position_in_bar = click_x - progress_bar_start_x
-            
+
             # Each character in the progress bar represents an equal portion of the document
             # Convert to percentage (0-100)
             click_percentage = (click_position_in_bar / (progress_bar_width - 1)) * 100
             click_percentage = max(0, min(100, click_percentage))  # Clamp to 0-100
-            
+
             # Convert percentage to scroll position
             available_height = max(1, height - 4)
             max_scroll = max(0, len(self.document_lines) - available_height)
             target_scroll = (click_percentage / 100) * max_scroll
-            
+
             # Jump to that position
             self.auto_scroll_enabled = False
-            self.scroll_offset = self.target_scroll_offset = max(0, min(target_scroll, max_scroll))
-            
+            self.scroll_offset = self.target_scroll_offset = max(
+                0, min(target_scroll, max_scroll)
+            )
+
             if self.smooth_scroll_task and not self.smooth_scroll_task.done():
                 self.smooth_scroll_task.cancel()
-            
+
             self._save_extended_progress()
             return True
-        
+
         return False
 
     def _is_click_in_selection(self, click_pos):
         """Check if a click position is within the current selection."""
-        if not self.selection_active or not self.selection_start or not self.selection_end or not click_pos:
+        if (
+            not self.selection_active
+            or not self.selection_start
+            or not self.selection_end
+            or not click_pos
+        ):
             return False
-        
+
         click_line, click_char = click_pos
         start_line, start_char = self.selection_start
         end_line, end_char = self.selection_end
-        
+
         # Ensure start comes before end
         if start_line > end_line or (start_line == end_line and start_char > end_char):
-            start_line, start_char, end_line, end_char = end_line, end_char, start_line, start_char
-        
+            start_line, start_char, end_line, end_char = (
+                end_line,
+                end_char,
+                start_line,
+                start_char,
+            )
+
         # Check if click is within selection bounds
         if start_line <= click_line <= end_line:
             if start_line == end_line:
@@ -483,7 +612,7 @@ class Lue:
             else:
                 # Middle line of multi-line selection
                 return True
-        
+
         return False
 
     def _clear_selection(self):
@@ -496,24 +625,33 @@ class Lue:
 
     def _get_selected_text(self):
         """Get the currently selected text as a string."""
-        if not self.selection_active or not self.selection_start or not self.selection_end:
+        if (
+            not self.selection_active
+            or not self.selection_start
+            or not self.selection_end
+        ):
             return ""
-        
+
         start_line, start_char = self.selection_start
         end_line, end_char = self.selection_end
-        
+
         # Ensure start comes before end
         if start_line > end_line or (start_line == end_line and start_char > end_char):
-            start_line, start_char, end_line, end_char = end_line, end_char, start_line, start_char
-        
+            start_line, start_char, end_line, end_char = (
+                end_line,
+                end_char,
+                start_line,
+                start_char,
+            )
+
         selected_text = []
-        
+
         for line_idx in range(start_line, end_line + 1):
             if line_idx >= len(self.document_lines):
                 break
-                
+
             line_text = self.document_lines[line_idx].plain
-            
+
             if start_line == end_line:
                 # Single line selection
                 selection_start = max(0, min(start_char, len(line_text)))
@@ -530,20 +668,20 @@ class Lue:
             else:
                 # Middle line of multi-line selection
                 selected_text.append(line_text)
-        
+
         # Join all lines with spaces instead of newlines
         raw_text = " ".join(selected_text)
-        
+
         # Clean up the text: replace multiple spaces with single spaces
         # This handles cases like "  ", "   ", "    ", etc.
-        cleaned_text = re.sub(r' {2,}', ' ', raw_text)
-        
+        cleaned_text = re.sub(r" {2,}", " ", raw_text)
+
         # Remove any remaining newlines (just in case)
-        cleaned_text = cleaned_text.replace('\n', ' ')
-        
+        cleaned_text = cleaned_text.replace("\n", " ")
+
         # Clean up any double spaces that might have been created
-        cleaned_text = re.sub(r' {2,}', ' ', cleaned_text)
-        
+        cleaned_text = re.sub(r" {2,}", " ", cleaned_text)
+
         # Strip leading/trailing whitespace
         return cleaned_text.strip()
 
@@ -551,10 +689,10 @@ class Lue:
         """Copy text to system clipboard using pbcopy on macOS."""
         if not text:
             return False
-            
+
         try:
             # Use pbcopy on macOS to copy to clipboard
-            process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE, text=True)
+            process = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE, text=True)
             process.communicate(input=text)
             return process.returncode == 0
         except (subprocess.CalledProcessError, FileNotFoundError):
@@ -564,7 +702,7 @@ class Lue:
         """Handle copying selected text to clipboard."""
         if not self.selection_active:
             return False
-            
+
         selected_text = self._get_selected_text()
         if selected_text:
             success = self._copy_to_clipboard(selected_text)
@@ -576,7 +714,9 @@ class Lue:
 
     def _increase_speed(self):
         """Increase playback speed."""
-        speed_levels = [round(i * 0.1, 1) for i in range(10, 31)]  # 1.0 to 3.0 in 0.1 increments
+        speed_levels = [
+            round(i * 0.1, 1) for i in range(10, 31)
+        ]  # 1.0 to 3.0 in 0.1 increments
         current_index = 0
         for i, speed in enumerate(speed_levels):
             if abs(speed - self.playback_speed) < 0.01:
@@ -591,7 +731,9 @@ class Lue:
 
     def _decrease_speed(self):
         """Decrease playback speed (limited to not go below 1.0x)."""
-        speed_levels = [round(i * 0.1, 1) for i in range(10, 31)]  # 1.0 to 3.0 in 0.1 increments
+        speed_levels = [
+            round(i * 0.1, 1) for i in range(10, 31)
+        ]  # 1.0 to 3.0 in 0.1 increments
         current_index = 0
         for i, speed in enumerate(speed_levels):
             if abs(speed - self.playback_speed) < 0.01:
@@ -609,46 +751,50 @@ class Lue:
         """Get the speed display string for UI using superscript characters with middle dot and fixed decimal places."""
         if abs(self.playback_speed - 1.0) < 0.01:
             return ""  # Don't show anything for normal speed
-        
+
         # Mapping of regular digits to superscript digits
         superscript_map = {
-            '0': '⁰',
-            '1': '¹',
-            '2': '²',
-            '3': '³',
-            '4': '⁴',
-            '5': '⁵',
-            '6': '⁶',
-            '7': '⁷',
-            '8': '⁸',
-            '9': '⁹',
-            '.': ''  # Decimal point
+            "0": "⁰",
+            "1": "¹",
+            "2": "²",
+            "3": "³",
+            "4": "⁴",
+            "5": "⁵",
+            "6": "⁶",
+            "7": "⁷",
+            "8": "⁸",
+            "9": "⁹",
+            ".": "",  # Decimal point
         }
-        
+
         # Format speed as a string with exactly two decimal places and convert to superscript
         speed_str = f"{self.playback_speed:.2f}"
-        superscript_str = ''.join(superscript_map.get(char, char) for char in speed_str)
-        
+        superscript_str = "".join(superscript_map.get(char, char) for char in speed_str)
+
         # Return the speed indicator without leading space
         return f"ˣ{superscript_str}"
 
-    def _advance_position(self, current_pos, mode='sentence', wrap=True):
+    def _advance_position(self, current_pos, mode="sentence", wrap=True):
         c, p, s = current_pos
-        if mode == 'paragraph': p, s = p + 1, 0
-        else: s += 1
+        if mode == "paragraph":
+            p, s = p + 1, 0
+        else:
+            s += 1
         while c < len(self.chapters):
             if p < len(self.chapters[c]):
                 if s < len(content_parser.split_into_sentences(self.chapters[c][p])):
-                    if mode == 'paragraph': s = 0
+                    if mode == "paragraph":
+                        s = 0
                     return c, p, s
                 p, s = p + 1, 0
-            else: c, p, s = c + 1, 0, 0
+            else:
+                c, p, s = c + 1, 0, 0
         # If we've reached the end, either wrap to beginning or return None
         return (0, 0, 0) if wrap else None
 
-    def _rewind_position(self, current_pos, mode='sentence'):
+    def _rewind_position(self, current_pos, mode="sentence"):
         c, p, s = current_pos
-        if mode == 'paragraph':
+        if mode == "paragraph":
             p, s = p - 1, 0
         else:
             s -= 1
@@ -656,23 +802,34 @@ class Lue:
         while c >= 0:
             if p >= 0:
                 if s >= 0:
-                    if mode == 'paragraph':
+                    if mode == "paragraph":
                         s = 0
                     return c, p, s
-                
+
                 p -= 1
                 if p >= 0:
-                    s = len(content_parser.split_into_sentences(self.chapters[c][p])) - 1
+                    s = (
+                        len(content_parser.split_into_sentences(self.chapters[c][p]))
+                        - 1
+                    )
                 else:
                     c -= 1
                     if c >= 0:
                         p = len(self.chapters[c]) - 1
-                        s = len(content_parser.split_into_sentences(self.chapters[c][p])) - 1
+                        s = (
+                            len(
+                                content_parser.split_into_sentences(self.chapters[c][p])
+                            )
+                            - 1
+                        )
             else:
                 c -= 1
                 if c >= 0:
                     p = len(self.chapters[c]) - 1
-                    s = len(content_parser.split_into_sentences(self.chapters[c][p])) - 1
+                    s = (
+                        len(content_parser.split_into_sentences(self.chapters[c][p]))
+                        - 1
+                    )
 
         # If we've rewound past the beginning, loop to the end
         c = len(self.chapters) - 1
@@ -685,14 +842,14 @@ class Lue:
         top_visible_line = int(self.scroll_offset)
         bottom_visible_line = top_visible_line + max(1, ui.get_terminal_size()[1] - 4)
         topmost_sentence_pos = None
-        earliest_line = float('inf')
+        earliest_line = float("inf")
 
         for pos, line_num in self.position_to_line.items():
             if top_visible_line <= line_num < bottom_visible_line:
                 if line_num < earliest_line:
                     earliest_line = line_num
                     topmost_sentence_pos = pos
-        
+
         if topmost_sentence_pos:
             return topmost_sentence_pos
 
@@ -703,12 +860,24 @@ class Lue:
                 latest_line = line_num
                 last_pos_before_view = pos
         return last_pos_before_view
-    
+
     def _calculate_progress_percentage(self):
-        if self.total_sentences == 0: return 100.0
-        sentences_read = sum(len(content_parser.split_into_sentences(p)) for i in range(self.chapter_idx) for p in self.chapters[i])
+        if self.total_sentences == 0:
+            return 100.0
+        sentences_read = sum(
+            len(content_parser.split_into_sentences(p))
+            for i in range(self.chapter_idx)
+            for p in self.chapters[i]
+        )
         if self.chapter_idx < len(self.chapters):
-            sentences_read += sum(len(content_parser.split_into_sentences(self.chapters[self.chapter_idx][i])) for i in range(self.paragraph_idx))
+            sentences_read += sum(
+                len(
+                    content_parser.split_into_sentences(
+                        self.chapters[self.chapter_idx][i]
+                    )
+                )
+                for i in range(self.paragraph_idx)
+            )
             sentences_read += self.sentence_idx
         return (sentences_read / self.total_sentences) * 100
 
@@ -716,52 +885,77 @@ class Lue:
         """Calculate progress percentage based on current scroll position."""
         if len(self.document_lines) == 0:
             return 100.0
-        
+
         # Calculate scroll percentage based on current scroll position
         _, height = ui.get_terminal_size()
         available_height = max(1, height - 4)
         max_scroll = max(0, len(self.document_lines) - available_height)
-        
+
         if max_scroll == 0:
             return 100.0
-        
+
         scroll_percentage = (self.scroll_offset / max_scroll) * 100
         return min(100.0, max(0.0, scroll_percentage))
 
     def _save_extended_progress(self, sync_audio_position=False):
         if sync_audio_position:
-            self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        
+            self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+                self.ui_chapter_idx,
+                self.ui_paragraph_idx,
+                self.ui_sentence_idx,
+            )
+
         manual_scroll_anchor = self._get_topmost_visible_sentence()
 
         progress_manager.save_extended_progress(
-            self.progress_file, 
-            self.chapter_idx, 
-            self.paragraph_idx, 
-            self.sentence_idx, 
-            self.scroll_offset, 
-            not self.is_paused, 
+            self.progress_file,
+            self.chapter_idx,
+            self.paragraph_idx,
+            self.sentence_idx,
+            self.scroll_offset,
+            not self.is_paused,
             self.auto_scroll_enabled,
             manual_scroll_anchor=manual_scroll_anchor,
             original_file_path=self.file_path,
             playback_speed=self.playback_speed,
-            percentage=self._calculate_ui_progress_percentage()
+            percentage=self._calculate_ui_progress_percentage(),
         )
 
     def _scroll_to_position_immediate(self, chapter_idx, paragraph_idx, sentence_idx):
         if (chapter_idx, paragraph_idx, sentence_idx) in self.position_to_line:
-            target_line = self.position_to_line[(chapter_idx, paragraph_idx, sentence_idx)]
+            target_line = self.position_to_line[
+                (chapter_idx, paragraph_idx, sentence_idx)
+            ]
             _, height = ui.get_terminal_size()
             available_height = max(1, height - 4)
-            new_offset = min(max(0, target_line - available_height // 2), max(0, len(self.document_lines) - available_height))
+            new_offset = min(
+                max(0, target_line - available_height // 2),
+                max(0, len(self.document_lines) - available_height),
+            )
             self.scroll_offset = self.target_scroll_offset = new_offset
 
     def _handle_scroll_up_immediate(self):
         self.auto_scroll_enabled = False
         self.scroll_offset = self.target_scroll_offset = max(0, self.scroll_offset - 1)
-        if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
-        self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+            self.smooth_scroll_task.cancel()
+        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+            self.ui_chapter_idx,
+            self.ui_paragraph_idx,
+            self.ui_sentence_idx,
+        )
+        progress_manager.save_extended_progress(
+            self.progress_file,
+            self.chapter_idx,
+            self.paragraph_idx,
+            self.sentence_idx,
+            self.scroll_offset,
+            not self.is_paused,
+            self.auto_scroll_enabled,
+            original_file_path=self.file_path,
+            playback_speed=self.playback_speed,
+            percentage=self._calculate_ui_progress_percentage(),
+        )
 
     def _handle_scroll_up_smooth(self):
         self.auto_scroll_enabled = False
@@ -770,17 +964,51 @@ class Lue:
             self._smooth_scroll_to(target_offset)
         else:
             self.scroll_offset = self.target_scroll_offset = target_offset
-            if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
-        self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+            if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+                self.smooth_scroll_task.cancel()
+        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+            self.ui_chapter_idx,
+            self.ui_paragraph_idx,
+            self.ui_sentence_idx,
+        )
+        progress_manager.save_extended_progress(
+            self.progress_file,
+            self.chapter_idx,
+            self.paragraph_idx,
+            self.sentence_idx,
+            self.scroll_offset,
+            not self.is_paused,
+            self.auto_scroll_enabled,
+            original_file_path=self.file_path,
+            playback_speed=self.playback_speed,
+            percentage=self._calculate_ui_progress_percentage(),
+        )
 
     def _handle_scroll_down_immediate(self):
         self.auto_scroll_enabled = False
         max_scroll = max(0, len(self.document_lines) - (ui.get_terminal_size()[1] - 4))
-        self.scroll_offset = self.target_scroll_offset = min(max_scroll, self.scroll_offset + 1)
-        if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
-        self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+        self.scroll_offset = self.target_scroll_offset = min(
+            max_scroll, self.scroll_offset + 1
+        )
+        if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+            self.smooth_scroll_task.cancel()
+        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+            self.ui_chapter_idx,
+            self.ui_paragraph_idx,
+            self.ui_sentence_idx,
+        )
+        progress_manager.save_extended_progress(
+            self.progress_file,
+            self.chapter_idx,
+            self.paragraph_idx,
+            self.sentence_idx,
+            self.scroll_offset,
+            not self.is_paused,
+            self.auto_scroll_enabled,
+            original_file_path=self.file_path,
+            playback_speed=self.playback_speed,
+            percentage=self._calculate_ui_progress_percentage(),
+        )
 
     def _handle_scroll_down_smooth(self):
         self.auto_scroll_enabled = False
@@ -790,14 +1018,34 @@ class Lue:
             self._smooth_scroll_to(target_offset)
         else:
             self.scroll_offset = self.target_scroll_offset = target_offset
-            if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
-        self.chapter_idx, self.paragraph_idx, self.sentence_idx = self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx
-        progress_manager.save_extended_progress(self.progress_file, self.chapter_idx, self.paragraph_idx, self.sentence_idx, self.scroll_offset, not self.is_paused, self.auto_scroll_enabled, original_file_path=self.file_path, playback_speed=self.playback_speed, percentage=self._calculate_ui_progress_percentage())
+            if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+                self.smooth_scroll_task.cancel()
+        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+            self.ui_chapter_idx,
+            self.ui_paragraph_idx,
+            self.ui_sentence_idx,
+        )
+        progress_manager.save_extended_progress(
+            self.progress_file,
+            self.chapter_idx,
+            self.paragraph_idx,
+            self.sentence_idx,
+            self.scroll_offset,
+            not self.is_paused,
+            self.auto_scroll_enabled,
+            original_file_path=self.file_path,
+            playback_speed=self.playback_speed,
+            percentage=self._calculate_ui_progress_percentage(),
+        )
 
     def _handle_navigation_immediate(self, cmd):
         current_pos = (self.chapter_idx, self.paragraph_idx, self.sentence_idx)
-        direction, mode = cmd.split('_')
-        new_pos = self._advance_position(current_pos, mode) if direction == 'next' else self._rewind_position(current_pos, mode)
+        direction, mode = cmd.split("_")
+        new_pos = (
+            self._advance_position(current_pos, mode)
+            if direction == "next"
+            else self._rewind_position(current_pos, mode)
+        )
         if new_pos:
             self.first_sentence_jump = False
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = new_pos
@@ -807,8 +1055,12 @@ class Lue:
 
     def _handle_navigation_smooth(self, cmd):
         current_pos = (self.chapter_idx, self.paragraph_idx, self.sentence_idx)
-        direction, mode = cmd.split('_')
-        new_pos = self._advance_position(current_pos, mode) if direction == 'next' else self._rewind_position(current_pos, mode)
+        direction, mode = cmd.split("_")
+        new_pos = (
+            self._advance_position(current_pos, mode)
+            if direction == "next"
+            else self._rewind_position(current_pos, mode)
+        )
         if new_pos:
             self.first_sentence_jump = False
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = new_pos
@@ -818,7 +1070,10 @@ class Lue:
                 target_line = self.position_to_line[new_pos]
                 _, height = ui.get_terminal_size()
                 available_height = max(1, height - 4)
-                new_offset = min(max(0, target_line - available_height // 2), max(0, len(self.document_lines) - available_height))
+                new_offset = min(
+                    max(0, target_line - available_height // 2),
+                    max(0, len(self.document_lines) - available_height),
+                )
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._smooth_scroll_to(new_offset)
                 else:
@@ -835,12 +1090,12 @@ class Lue:
                     await self.pending_restart_task
                 except asyncio.CancelledError:
                     pass
-            
+
             await audio.stop_and_clear_audio(self)
-            
+
             # Add a small delay to debounce rapid navigation
             await asyncio.sleep(0.1)
-            
+
             # Check if we're still running and not paused after the delay
             if not self.is_paused and self.running:
                 await audio.play_from_current_position(self)
@@ -848,48 +1103,79 @@ class Lue:
     def _handle_page_scroll_immediate(self, direction):
         self.auto_scroll_enabled = False
         page_size = max(1, ui.get_terminal_size()[1] - 4)
-        new_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max(0, len(self.document_lines) - page_size), self.scroll_offset + page_size)
+        new_offset = (
+            max(0, self.scroll_offset - page_size)
+            if direction < 0
+            else min(
+                max(0, len(self.document_lines) - page_size),
+                self.scroll_offset + page_size,
+            )
+        )
         self.scroll_offset = self.target_scroll_offset = new_offset
-        if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
+        if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+            self.smooth_scroll_task.cancel()
         self._save_extended_progress()
 
     def _handle_page_scroll_smooth(self, direction):
         self.auto_scroll_enabled = False
         page_size = max(1, ui.get_terminal_size()[1] - 4)
-        target_offset = max(0, self.scroll_offset - page_size) if direction < 0 else min(max(0, len(self.document_lines) - page_size), self.scroll_offset + page_size)
+        target_offset = (
+            max(0, self.scroll_offset - page_size)
+            if direction < 0
+            else min(
+                max(0, len(self.document_lines) - page_size),
+                self.scroll_offset + page_size,
+            )
+        )
         if config.SMOOTH_SCROLLING_ENABLED:
             self._smooth_scroll_to(target_offset)
         else:
             self.scroll_offset = self.target_scroll_offset = target_offset
-            if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
+            if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+                self.smooth_scroll_task.cancel()
         self._save_extended_progress()
 
     def _handle_move_to_top_immediate(self):
-        top_visible_line, bottom_visible_line = int(self.scroll_offset), int(self.scroll_offset) + max(1, ui.get_terminal_size()[1] - 4)
-        topmost_sentence, topmost_line = None, float('inf')
+        top_visible_line, bottom_visible_line = (
+            int(self.scroll_offset),
+            int(self.scroll_offset) + max(1, ui.get_terminal_size()[1] - 4),
+        )
+        topmost_sentence, topmost_line = None, float("inf")
         for pos, line in self.position_to_line.items():
             if top_visible_line <= line < bottom_visible_line and line < topmost_line:
                 topmost_line, topmost_sentence = line, pos
         if topmost_sentence:
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = topmost_sentence
-            self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = topmost_sentence
+            self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = (
+                topmost_sentence
+            )
             self.first_sentence_jump = True
         self.auto_scroll_enabled = True
-        if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
+        if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+            self.smooth_scroll_task.cancel()
         self._save_extended_progress()
 
     def _handle_move_to_top_smooth(self):
-        top_visible_line, bottom_visible_line = int(self.scroll_offset), int(self.scroll_offset) + max(1, ui.get_terminal_size()[1] - 4)
-        topmost_sentence, topmost_line = None, float('inf')
+        top_visible_line, bottom_visible_line = (
+            int(self.scroll_offset),
+            int(self.scroll_offset) + max(1, ui.get_terminal_size()[1] - 4),
+        )
+        topmost_sentence, topmost_line = None, float("inf")
         for pos, line in self.position_to_line.items():
             if top_visible_line <= line < bottom_visible_line and line < topmost_line:
                 topmost_line, topmost_sentence = line, pos
         if topmost_sentence:
             self.chapter_idx, self.paragraph_idx, self.sentence_idx = topmost_sentence
-            self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = topmost_sentence
+            self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = (
+                topmost_sentence
+            )
             self.first_sentence_jump = True
         self.auto_scroll_enabled = True
-        if config.SMOOTH_SCROLLING_ENABLED and topmost_sentence and topmost_sentence in self.position_to_line:
+        if (
+            config.SMOOTH_SCROLLING_ENABLED
+            and topmost_sentence
+            and topmost_sentence in self.position_to_line
+        ):
             target_line = self.position_to_line[topmost_sentence]
             _, height = ui.get_terminal_size()
             available_height = max(1, height - 4)
@@ -898,7 +1184,8 @@ class Lue:
             target_offset = min(target_offset, max_scroll)
             self._smooth_scroll_to(target_offset)
         else:
-            if self.smooth_scroll_task and not self.smooth_scroll_task.done(): self.smooth_scroll_task.cancel()
+            if self.smooth_scroll_task and not self.smooth_scroll_task.done():
+                self.smooth_scroll_task.cancel()
         self._save_extended_progress()
 
     def _handle_move_to_beginning_immediate(self):
@@ -947,16 +1234,19 @@ class Lue:
         """Handle pause/resume toggle with proper locking to prevent concurrent audio playback."""
         async with self.pause_toggle_lock:
             # Cancel any existing pause toggle task
-            if self.current_pause_toggle_task and not self.current_pause_toggle_task.done():
+            if (
+                self.current_pause_toggle_task
+                and not self.current_pause_toggle_task.done()
+            ):
                 self.current_pause_toggle_task.cancel()
                 try:
                     await self.current_pause_toggle_task
                 except asyncio.CancelledError:
                     pass
-            
+
             # Stop current audio playback
             await audio.stop_and_clear_audio(self)
-            
+
             # Only start playback if we're not paused and still running
             if not self.is_paused and self.running and self.tts_model:
                 await audio.play_from_current_position(self)
@@ -969,27 +1259,49 @@ class Lue:
                 if top_sentence and top_sentence in self.position_to_line:
                     top_line = self.position_to_line[top_sentence]
                     available_height = max(1, ui.get_terminal_size()[1] - 4)
-                    fraction_in_view = (top_line - self.scroll_offset) / available_height
+                    fraction_in_view = (
+                        top_line - self.scroll_offset
+                    ) / available_height
                     # Clamp between 0 and 1
                     fraction_in_view = max(0.0, min(1.0, fraction_in_view))
                     self.resize_anchor = (top_sentence, fraction_in_view)
 
             self.resize_scheduled = True
-            self.loop.call_soon_threadsafe(self._post_command_sync, '_resize')
+            self.loop.call_soon_threadsafe(self._post_command_sync, "_resize")
 
     async def _ui_update_loop(self):
-        last_update_time, last_sentence_pos, last_progress_save_time = 0, None, asyncio.get_event_loop().time()
+        last_update_time, last_sentence_pos, last_progress_save_time = (
+            0,
+            None,
+            asyncio.get_event_loop().time(),
+        )
         progress_save_interval = 5.0
         while self.running:
             try:
                 current_time = asyncio.get_event_loop().time()
                 needs_update = False
                 if not self.is_paused:
-                    target_pos = (self.chapter_idx, self.paragraph_idx, self.sentence_idx)
-                    if target_pos != (self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx):
-                        if self.first_sentence_jump and last_sentence_pos is not None and target_pos != last_sentence_pos:
+                    target_pos = (
+                        self.chapter_idx,
+                        self.paragraph_idx,
+                        self.sentence_idx,
+                    )
+                    if target_pos != (
+                        self.ui_chapter_idx,
+                        self.ui_paragraph_idx,
+                        self.ui_sentence_idx,
+                    ):
+                        if (
+                            self.first_sentence_jump
+                            and last_sentence_pos is not None
+                            and target_pos != last_sentence_pos
+                        ):
                             self.first_sentence_jump = False
-                        self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = target_pos
+                        (
+                            self.ui_chapter_idx,
+                            self.ui_paragraph_idx,
+                            self.ui_sentence_idx,
+                        ) = target_pos
                         needs_update = True
                         if self.auto_scroll_enabled:
                             self.last_auto_scroll_position = target_pos
@@ -998,13 +1310,14 @@ class Lue:
                 if (current_time - last_progress_save_time) >= progress_save_interval:
                     self._save_extended_progress()
                     last_progress_save_time = current_time
-                
+
                 # Always render on a fixed interval to catch all state changes
                 await ui.display_ui(self)
                 last_update_time = current_time
-                
+
                 await asyncio.sleep(self.ui_update_interval)
-            except asyncio.CancelledError: break
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logging.error(f"Error in UI update loop: {e}", exc_info=True)
                 await asyncio.sleep(self.ui_update_interval)
@@ -1013,14 +1326,17 @@ class Lue:
         """Update word index during playback based on elapsed time."""
         while self.running:
             try:
-                if (not self.is_paused and
-                    hasattr(self, 'current_sentence_words') and
-                    hasattr(self, 'current_sentence_duration') and
-                    hasattr(self, 'current_word_start_time') and
-                    self.current_sentence_words and
-                    self.current_sentence_duration > 0):
-
-                    elapsed = asyncio.get_event_loop().time() - self.current_word_start_time
+                if (
+                    not self.is_paused
+                    and hasattr(self, "current_sentence_words")
+                    and hasattr(self, "current_sentence_duration")
+                    and hasattr(self, "current_word_start_time")
+                    and self.current_sentence_words
+                    and self.current_sentence_duration > 0
+                ):
+                    elapsed = (
+                        asyncio.get_event_loop().time() - self.current_word_start_time
+                    )
                     # Account for playback speed
                     adjusted_elapsed = elapsed * self.playback_speed
 
@@ -1028,37 +1344,56 @@ class Lue:
                     total_words = len(self.current_sentence_words)
                     if total_words > 0:
                         current_word_idx = 0
-                        
+
                         # Use precise word timings if available
-                        if hasattr(self, 'current_word_timings') and self.current_word_timings:
+                        if (
+                            hasattr(self, "current_word_timings")
+                            and self.current_word_timings
+                        ):
                             # Use word mapping if available to handle TTS word boundary mismatches
-                            if hasattr(self, 'current_word_mapping') and self.current_word_mapping:
+                            if (
+                                hasattr(self, "current_word_mapping")
+                                and self.current_word_mapping
+                            ):
                                 # Find which TTS word should be highlighted based on timing
                                 tts_word_idx = None
                                 tts_word_start = None
                                 tts_word_end = None
-                                for i, (word, start_time, end_time) in enumerate(self.current_word_timings):
-                                    if adjusted_elapsed >= start_time and adjusted_elapsed < end_time:
+                                for i, (word, start_time, end_time) in enumerate(
+                                    self.current_word_timings
+                                ):
+                                    if (
+                                        adjusted_elapsed >= start_time
+                                        and adjusted_elapsed < end_time
+                                    ):
                                         tts_word_idx = i
                                         tts_word_start = start_time
                                         tts_word_end = end_time
                                         break
-                                
+
                                 # If we've passed all TTS words, use the last one
                                 if tts_word_idx is None and self.current_word_timings:
-                                    sentence_duration = max([end for _, _, end in self.current_word_timings])
+                                    sentence_duration = max(
+                                        [end for _, _, end in self.current_word_timings]
+                                    )
                                     if adjusted_elapsed >= sentence_duration:
-                                        tts_word_idx = len(self.current_word_timings) - 1
-                                        _, tts_word_start, tts_word_end = self.current_word_timings[tts_word_idx]
-                                
+                                        tts_word_idx = (
+                                            len(self.current_word_timings) - 1
+                                        )
+                                        _, tts_word_start, tts_word_end = (
+                                            self.current_word_timings[tts_word_idx]
+                                        )
+
                                 # Map TTS word index back to original word index with sub-word timing
                                 if tts_word_idx is not None:
                                     # Find all original words that map to this TTS word
                                     mapped_orig_words = []
-                                    for orig_idx, mapped_tts_idx in enumerate(self.current_word_mapping):
+                                    for orig_idx, mapped_tts_idx in enumerate(
+                                        self.current_word_mapping
+                                    ):
                                         if mapped_tts_idx == tts_word_idx:
                                             mapped_orig_words.append(orig_idx)
-                                    
+
                                     if mapped_orig_words:
                                         if len(mapped_orig_words) == 1:
                                             # Only one original word maps to this TTS word
@@ -1067,33 +1402,59 @@ class Lue:
                                             # Multiple original words map to this TTS word
                                             # Distribute the TTS word duration among the original words
                                             tts_duration = tts_word_end - tts_word_start
-                                            time_per_orig_word = tts_duration / len(mapped_orig_words)
-                                            elapsed_in_tts_word = adjusted_elapsed - tts_word_start
-                                            
+                                            time_per_orig_word = tts_duration / len(
+                                                mapped_orig_words
+                                            )
+                                            elapsed_in_tts_word = (
+                                                adjusted_elapsed - tts_word_start
+                                            )
+
                                             # Find which original word should be highlighted
-                                            sub_word_idx = min(int(elapsed_in_tts_word / time_per_orig_word), len(mapped_orig_words) - 1)
-                                            current_word_idx = mapped_orig_words[sub_word_idx]
+                                            sub_word_idx = min(
+                                                int(
+                                                    elapsed_in_tts_word
+                                                    / time_per_orig_word
+                                                ),
+                                                len(mapped_orig_words) - 1,
+                                            )
+                                            current_word_idx = mapped_orig_words[
+                                                sub_word_idx
+                                            ]
                                     else:
                                         # Fallback: use the TTS word index directly if no mapping found
-                                        current_word_idx = min(tts_word_idx, total_words - 1)
+                                        current_word_idx = min(
+                                            tts_word_idx, total_words - 1
+                                        )
                             else:
                                 # Original logic for direct TTS word timing
-                                for i, (word, start_time, end_time) in enumerate(self.current_word_timings):
+                                for i, (word, start_time, end_time) in enumerate(
+                                    self.current_word_timings
+                                ):
                                     # Check if current time falls within this word's timing
-                                    if adjusted_elapsed >= start_time and adjusted_elapsed < end_time:
+                                    if (
+                                        adjusted_elapsed >= start_time
+                                        and adjusted_elapsed < end_time
+                                    ):
                                         current_word_idx = min(i, total_words - 1)
                                         break
                                 # If we've passed all words, highlight the last one
                                 else:
                                     if self.current_word_timings:
                                         # Only highlight the last word if we've actually finished the sentence
-                                        sentence_duration = max([end for _, _, end in self.current_word_timings])
+                                        sentence_duration = max(
+                                            [
+                                                end
+                                                for _, _, end in self.current_word_timings
+                                            ]
+                                        )
                                         if adjusted_elapsed >= sentence_duration:
                                             current_word_idx = total_words - 1
                         else:
                             # Estimate time per word (simple equal distribution)
                             time_per_word = self.current_sentence_duration / total_words
-                            current_word_idx = min(int(adjusted_elapsed / time_per_word), total_words - 1)
+                            current_word_idx = min(
+                                int(adjusted_elapsed / time_per_word), total_words - 1
+                            )
 
                         # Update word index if it changed
                         if current_word_idx != self.ui_word_idx:
@@ -1110,9 +1471,15 @@ class Lue:
         signal.signal(signal.SIGWINCH, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        
+
         # Cancel all tasks including pending restart task and pause toggle task
-        tasks_to_cancel = [self.smooth_scroll_task, self.ui_update_task, self.word_update_task, self.pending_restart_task, self.current_pause_toggle_task]
+        tasks_to_cancel = [
+            self.smooth_scroll_task,
+            self.ui_update_task,
+            self.word_update_task,
+            self.pending_restart_task,
+            self.current_pause_toggle_task,
+        ]
         for task in tasks_to_cancel:
             if task and not task.done():
                 task.cancel()
@@ -1120,12 +1487,12 @@ class Lue:
                     await asyncio.wait_for(task, timeout=1.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
-        
+
         await audio.stop_and_clear_audio(self)
         self._save_extended_progress()
         logging.info("--- Application Shutting Down ---")
         # Disable mouse reporting and restore terminal
-        sys.stdout.write('\033[?1002l\033[2J\033[H\033[?25h')
+        sys.stdout.write("\033[?1002l\033[2J\033[H\033[?25h")
         sys.stdout.flush()
 
         if config.SHOW_ERRORS_ON_EXIT:
@@ -1133,22 +1500,30 @@ class Lue:
                 log_dir = platformdirs.user_log_dir(appname="lue", appauthor=False)
                 log_file = os.path.join(log_dir, "error.log")
                 if os.path.exists(log_file):
-                    with open(log_file, 'r') as f:
+                    with open(log_file, "r") as f:
                         lines = f.readlines()
-                    
-                    start_indices = [i for i, line in enumerate(lines) if "--- Application Starting ---" in line]
+
+                    start_indices = [
+                        i
+                        for i, line in enumerate(lines)
+                        if "--- Application Starting ---" in line
+                    ]
                     last_start_index = start_indices[-1] if start_indices else 0
-                    
+
                     session_lines = lines[last_start_index:]
-                    error_lines = [line.strip() for line in session_lines if " - ERROR - " in line]
-                    
+                    error_lines = [
+                        line.strip() for line in session_lines if " - ERROR - " in line
+                    ]
+
                     if error_lines:
                         error_console = Console()
-                        error_console.print("\n[bold red]Errors recorded during this session:[/bold red]")
+                        error_console.print(
+                            "\n[bold red]Errors recorded during this session:[/bold red]"
+                        )
                         for error in error_lines:
-                            message = ' - '.join(error.split(' - ')[3:])
+                            message = " - ".join(error.split(" - ")[3:])
                             error_console.print(f"- {message}")
-                    
+
                     # Clear the log file after displaying errors
                     os.remove(log_file)
             except FileNotFoundError:
@@ -1159,37 +1534,38 @@ class Lue:
     def _handle_exit_signal(self, signum, frame):
         self._save_extended_progress()
         self.running = False
-        if self.loop and self.loop.is_running(): self.loop.call_soon_threadsafe(self._post_command_sync, 'quit')
-
-
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self._post_command_sync, "quit")
 
     async def run(self):
         self.loop = asyncio.get_running_loop()
         self.loop.add_reader(sys.stdin.fileno(), input_handler.process_input, self)
-        
+
         # Enable mouse reporting for drag events (button motion only)
-        sys.stdout.write('\033[?1002h')  # Enable button motion events (drag only)
+        sys.stdout.write("\033[?1002h")  # Enable button motion events (drag only)
         sys.stdout.flush()
-        
+
         signal.signal(signal.SIGWINCH, self._handle_resize)
         signal.signal(signal.SIGINT, self._handle_exit_signal)
         signal.signal(signal.SIGTERM, self._handle_exit_signal)
-        
-        if not self.chapters or not self.chapters[0]: return
-            
+
+        if not self.chapters or not self.chapters[0]:
+            return
+
         self.ui_update_task = asyncio.create_task(self._ui_update_loop())
         self.word_update_task = asyncio.create_task(self._word_update_loop())
-        
+
         await audio.play_from_current_position(self)
-        
+
         while self.running:
             await self.command_received_event.wait()
             self.command_received_event.clear()
             cmd = self.command
             self.command = None
-            if not cmd: continue
-            
-            if cmd == 'toggle_recent_menu':
+            if not cmd:
+                continue
+
+            if cmd == "toggle_recent_menu":
                 self.show_recent_menu = not self.show_recent_menu
                 if self.show_recent_menu:
                     self.recent_books_list = progress_manager.get_recent_books()
@@ -1204,65 +1580,102 @@ class Lue:
                 continue
 
             if self.show_recent_menu:
-                if cmd in ['prev_sentence', 'prev_paragraph', 'scroll_up', 'scroll_page_up', 'wheel_scroll_up', 'move_to_beginning']:
+                if cmd in [
+                    "prev_sentence",
+                    "prev_paragraph",
+                    "scroll_up",
+                    "scroll_page_up",
+                    "wheel_scroll_up",
+                    "move_to_beginning",
+                ]:
                     if self.recent_books_list:
                         if self.recent_menu_selection_idx == 0:
-                            self.recent_menu_selection_idx = len(self.recent_books_list) - 1
+                            self.recent_menu_selection_idx = (
+                                len(self.recent_books_list) - 1
+                            )
                         else:
                             self.recent_menu_selection_idx -= 1
                     asyncio.create_task(ui.display_ui(self))
                     continue
-                elif cmd in ['next_sentence', 'next_paragraph', 'scroll_down', 'scroll_page_down', 'wheel_scroll_down', 'move_to_end']:
+                elif cmd in [
+                    "next_sentence",
+                    "next_paragraph",
+                    "scroll_down",
+                    "scroll_page_down",
+                    "wheel_scroll_down",
+                    "move_to_end",
+                ]:
                     if self.recent_books_list:
-                        if self.recent_menu_selection_idx == len(self.recent_books_list) - 1:
+                        if (
+                            self.recent_menu_selection_idx
+                            == len(self.recent_books_list) - 1
+                        ):
                             self.recent_menu_selection_idx = 0
                         else:
                             self.recent_menu_selection_idx += 1
                     asyncio.create_task(ui.display_ui(self))
                     continue
-                elif cmd == 'select_menu_item':
-                    if self.recent_books_list and 0 <= self.recent_menu_selection_idx < len(self.recent_books_list):
-                        book_data = self.recent_books_list[self.recent_menu_selection_idx]
-                        path = book_data['path']
+                elif cmd == "select_menu_item":
+                    if (
+                        self.recent_books_list
+                        and 0
+                        <= self.recent_menu_selection_idx
+                        < len(self.recent_books_list)
+                    ):
+                        book_data = self.recent_books_list[
+                            self.recent_menu_selection_idx
+                        ]
+                        path = book_data["path"]
                         await self._switch_book(path)
                     continue
-                elif cmd == 'quit':
-                     # Allow quit even if menu is open
-                     pass
-                elif cmd == '_resize':
-                     # Allow resize to fall through to the main resize handler
-                     pass
+                elif cmd == "quit":
+                    # Allow quit even if menu is open
+                    pass
+                elif cmd == "_resize":
+                    # Allow resize to fall through to the main resize handler
+                    pass
                 else:
                     # Ignore other commands while menu is open
                     continue
-            
+
             if isinstance(cmd, tuple):
                 command_name, data = cmd
-                if command_name == '_update_highlight':
-                    if not self.is_paused: self.chapter_idx, self.paragraph_idx, self.sentence_idx = data
-                elif command_name == '_new_sentence_started':
+                if command_name == "_update_highlight":
+                    if not self.is_paused:
+                        self.chapter_idx, self.paragraph_idx, self.sentence_idx = data
+                elif command_name == "_new_sentence_started":
                     c, p, s, duration, timing_data = data
-                    
+
                     # Update sentence position
                     self.chapter_idx, self.paragraph_idx, self.sentence_idx = c, p, s
-                    
+
                     # Reset word index for the new sentence
                     self.ui_word_idx = 0
-                    
+
                     # Set up timing information for the word_update_loop
                     if isinstance(timing_data, dict):
                         timing_info = timing_data
-                    else: # Handle old format
-                        timing_info = {"word_timings": timing_data, "speech_duration": duration, "total_duration": duration}
+                    else:  # Handle old format
+                        timing_info = {
+                            "word_timings": timing_data,
+                            "speech_duration": duration,
+                            "total_duration": duration,
+                        }
 
                     sentences = content_parser.split_into_sentences(self.chapters[c][p])
                     current_text = sentences[s]
                     # Use improved word filtering that excludes punctuation-only tokens
                     # but still preserves all text visually
-                    self.current_sentence_words = [token for token in current_text.split() if re.search(r'[a-zA-Z0-9]', token)]
-                    self.current_sentence_duration = timing_info.get("speech_duration") or duration
+                    self.current_sentence_words = [
+                        token
+                        for token in current_text.split()
+                        if re.search(r"[a-zA-Z0-9]", token)
+                    ]
+                    self.current_sentence_duration = (
+                        timing_info.get("speech_duration") or duration
+                    )
                     self.current_word_start_time = asyncio.get_event_loop().time()
-                    
+
                     word_timings = timing_info.get("word_timings", [])
                     if word_timings:
                         self.current_word_timings = word_timings
@@ -1270,38 +1683,49 @@ class Lue:
                     else:
                         self.current_word_timings = None
                         self.current_word_mapping = None
-                elif command_name == 'click_jump':
+                elif command_name == "click_jump":
                     if clicked_position := self._find_sentence_at_click(*data):
                         self.first_sentence_jump = False
-                        self.chapter_idx, self.paragraph_idx, self.sentence_idx = clicked_position
-                        self.ui_chapter_idx, self.ui_paragraph_idx, self.ui_sentence_idx = clicked_position
+                        self.chapter_idx, self.paragraph_idx, self.sentence_idx = (
+                            clicked_position
+                        )
+                        (
+                            self.ui_chapter_idx,
+                            self.ui_paragraph_idx,
+                            self.ui_sentence_idx,
+                        ) = clicked_position
                         self.auto_scroll_enabled = False
                         self._save_extended_progress(sync_audio_position=True)
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
+                        self.pending_restart_task = asyncio.create_task(
+                            self._restart_audio_after_navigation()
+                        )
                 continue
-            
-            if cmd == 'quit': break
 
-            if cmd == 'finish':
+            if cmd == "quit":
+                break
+
+            if cmd == "finish":
                 if self.player_task and not self.player_task.done():
                     await self.playback_finished_event.wait()
                 await self.audio_queue.join()
                 break
 
-            elif cmd == '_resize':
+            elif cmd == "_resize":
                 self.resize_scheduled = False
                 if self.smooth_scroll_task and not self.smooth_scroll_task.done():
                     self.smooth_scroll_task.cancel()
-                
+
                 # Store the current scroll offset percentage before resize
                 _, height = ui.get_terminal_size()
                 available_height = max(1, height - 4)
                 max_scroll = max(0, len(self.document_lines) - available_height)
-                old_scroll_percentage = self.scroll_offset / max_scroll if max_scroll > 0 else 0
-                
+                old_scroll_percentage = (
+                    self.scroll_offset / max_scroll if max_scroll > 0 else 0
+                )
+
                 # Update the document layout for the new window size
                 ui.update_document_layout(self)
-                
+
                 # If we're not in auto-scroll mode and have a resize anchor, use it
                 if not self.auto_scroll_enabled and self.resize_anchor:
                     anchor_pos, fraction_in_view = self.resize_anchor
@@ -1309,111 +1733,134 @@ class Lue:
                         target_line = self.position_to_line[anchor_pos]
                         _, new_height = ui.get_terminal_size()
                         new_available_height = max(1, new_height - 4)
-                        new_max_scroll = max(0, len(self.document_lines) - new_available_height)
-                        new_scroll = target_line - int(round(fraction_in_view * new_available_height))
+                        new_max_scroll = max(
+                            0, len(self.document_lines) - new_available_height
+                        )
+                        new_scroll = target_line - int(
+                            round(fraction_in_view * new_available_height)
+                        )
                         self.scroll_offset = max(0, target_line - available_height // 2)
                         self.target_scroll_offset = self.scroll_offset
                     else:
                         # Fallback to percentage-based scrolling if anchor is not found
                         _, new_height = ui.get_terminal_size()
                         new_available_height = max(1, new_height - 4)
-                        new_max_scroll = max(0, len(self.document_lines) - new_available_height)
+                        new_max_scroll = max(
+                            0, len(self.document_lines) - new_available_height
+                        )
                         self.scroll_offset = old_scroll_percentage * new_max_scroll
                         self.target_scroll_offset = self.scroll_offset
                 else:
                     # Fallback to percentage-based scrolling
                     _, new_height = ui.get_terminal_size()
                     new_available_height = max(1, new_height - 4)
-                    new_max_scroll = max(0, len(self.document_lines) - new_available_height)
+                    new_max_scroll = max(
+                        0, len(self.document_lines) - new_available_height
+                    )
                     self.scroll_offset = old_scroll_percentage * new_max_scroll
                     self.target_scroll_offset = self.scroll_offset
-                
+
                 # Clear the resize anchor after using it
                 self.resize_anchor = None
-                
+
                 # Save the new state
                 self._save_extended_progress()
-            elif cmd == 'pause':
-                if not self.tts_model: continue
+            elif cmd == "pause":
+                if not self.tts_model:
+                    continue
                 self.is_paused = not self.is_paused
                 self._save_extended_progress()
                 # Track the pause toggle task for proper management
-                self.current_pause_toggle_task = asyncio.create_task(self._handle_pause_toggle())
-            elif cmd in ['scroll_page_up', 'scroll_page_down']:
+                self.current_pause_toggle_task = asyncio.create_task(
+                    self._handle_pause_toggle()
+                )
+            elif cmd in ["scroll_page_up", "scroll_page_down"]:
                 if config.SMOOTH_SCROLLING_ENABLED:
-                    self._handle_page_scroll_smooth(-1 if 'up' in cmd else 1)
+                    self._handle_page_scroll_smooth(-1 if "up" in cmd else 1)
                 else:
-                    self._handle_page_scroll_immediate(-1 if 'up' in cmd else 1)
-            elif cmd in ['scroll_up', 'wheel_scroll_up']:
+                    self._handle_page_scroll_immediate(-1 if "up" in cmd else 1)
+            elif cmd in ["scroll_up", "wheel_scroll_up"]:
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_scroll_up_smooth()
                 else:
                     self._handle_scroll_up_immediate()
-            elif cmd in ['scroll_down', 'wheel_scroll_down']:
+            elif cmd in ["scroll_down", "wheel_scroll_down"]:
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_scroll_down_smooth()
                 else:
                     self._handle_scroll_down_immediate()
-            elif cmd == 'toggle_auto_scroll':
+            elif cmd == "toggle_auto_scroll":
                 self.auto_scroll_enabled = not self.auto_scroll_enabled
                 if self.auto_scroll_enabled:
                     if self.smooth_scroll_task and not self.smooth_scroll_task.done():
                         self.smooth_scroll_task.cancel()
-                    self._scroll_to_position_immediate(self.chapter_idx, self.paragraph_idx, self.sentence_idx)
+                    self._scroll_to_position_immediate(
+                        self.chapter_idx, self.paragraph_idx, self.sentence_idx
+                    )
                 self._save_extended_progress()
-            elif cmd == 'move_to_top_visible':
+            elif cmd == "move_to_top_visible":
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_move_to_top_smooth()
                 else:
                     self._handle_move_to_top_immediate()
-                self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
-            elif cmd == 'move_to_beginning':
+                self.pending_restart_task = asyncio.create_task(
+                    self._restart_audio_after_navigation()
+                )
+            elif cmd == "move_to_beginning":
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_move_to_beginning_smooth()
                 else:
                     self._handle_move_to_beginning_immediate()
-            elif cmd == 'move_to_end':
+            elif cmd == "move_to_end":
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_move_to_end_smooth()
                 else:
                     self._handle_move_to_end_immediate()
-            elif cmd == 'copy_selection':
+            elif cmd == "copy_selection":
                 self._handle_copy_selection()
-            elif cmd == 'increase_speed':
+            elif cmd == "increase_speed":
                 if self._increase_speed():
                     # Force immediate UI update to show new speed
                     asyncio.create_task(ui.display_ui(self))
                     # Restart audio with new speed if currently playing
                     if not self.is_paused and self.tts_model:
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
-            elif cmd == 'decrease_speed':
+                        self.pending_restart_task = asyncio.create_task(
+                            self._restart_audio_after_navigation()
+                        )
+            elif cmd == "decrease_speed":
                 if self._decrease_speed():
                     # Force immediate UI update to show new speed
                     asyncio.create_task(ui.display_ui(self))
                     # Restart audio with new speed if currently playing
                     if not self.is_paused and self.tts_model:
-                        self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
-            elif cmd == 'toggle_sentence_highlight':
-                config.SENTENCE_HIGHLIGHTING_ENABLED = not config.SENTENCE_HIGHLIGHTING_ENABLED
+                        self.pending_restart_task = asyncio.create_task(
+                            self._restart_audio_after_navigation()
+                        )
+            elif cmd == "toggle_sentence_highlight":
+                config.SENTENCE_HIGHLIGHTING_ENABLED = (
+                    not config.SENTENCE_HIGHLIGHTING_ENABLED
+                )
                 # Force immediate UI update
                 asyncio.create_task(ui.display_ui(self))
-            elif cmd == 'toggle_word_highlight':
+            elif cmd == "toggle_word_highlight":
                 # Cycle through word highlighting modes: 0=off, 1=normal, 2=standout
                 config.WORD_HIGHLIGHT_MODE = (config.WORD_HIGHLIGHT_MODE + 1) % 3
                 # Force immediate UI update
                 asyncio.create_task(ui.display_ui(self))
-            elif cmd == 'cycle_ui_complexity':
+            elif cmd == "cycle_ui_complexity":
                 # Cycle through UI complexity modes: 0=minimal, 1=medium, 2=full
                 config.UI_COMPLEXITY_MODE = (config.UI_COMPLEXITY_MODE + 1) % 3
                 # Update document layout to account for new available space
                 ui.update_document_layout(self)
                 # Force immediate UI update
                 asyncio.create_task(ui.display_ui(self))
-            elif 'next' in cmd or 'prev' in cmd:
+            elif "next" in cmd or "prev" in cmd:
                 if config.SMOOTH_SCROLLING_ENABLED:
                     self._handle_navigation_smooth(cmd)
                 else:
                     self._handle_navigation_immediate(cmd)
-                self.pending_restart_task = asyncio.create_task(self._restart_audio_after_navigation())
-                        
+                self.pending_restart_task = asyncio.create_task(
+                    self._restart_audio_after_navigation()
+                )
+
         await self._shutdown()
