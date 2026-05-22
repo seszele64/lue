@@ -28,7 +28,7 @@
 - [x] Update reader initialization to handle new property
 
 ## 6. Documentation
-- [ ] Add OpenAI TTS section to VOICES.md with available voices, pricing, and setup instructions
+- [x] Add OpenAI TTS section to VOICES.md with available voices, pricing, and setup instructions
 
 ## 7. Validation & Testing
 - [ ] Run `openspec validate add-openai-tts` and fix any issues

@@ -1,6 +1,6 @@
 # Lue - Voices and Languages Guide
 
-This document explains the speakers and languages included in the Edge and Kokoro TTS models, which are part of Lue’s default installation.
+This document explains the speakers and languages included in the Edge, Kokoro, and OpenAI TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key.
 
 ***
 
@@ -13,6 +13,7 @@ To configure voices and languages, edit the `lue/config.py` file:
 TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
+    "openai": "alloy",            # Default OpenAI voice
 }
 
 # Language settings for TTS models
@@ -659,3 +660,51 @@ Edge TTS provides a wide variety of voices across many languages. Always include
 *   pf_dora (Female)
 *   pm_alex (Male)
 *   pm_santa (Male)
+
+***
+
+### OpenAI TTS
+
+OpenAI TTS uses cloud-based voices powered by OpenAI's Speech API. It requires an API key and an internet connection. Unlike Edge and Kokoro, OpenAI TTS does not provide word-level timing metadata, so the reader automatically falls back to sentence-level highlighting.
+
+#### Setup
+
+1. Set your API key: `export OPENAI_API_KEY='your-key'`
+2. Install the package: `pip install lue[openai]`
+3. Use with: `lue book.epub --tts openai`
+
+#### Available Voices
+
+| Voice | Gender | Notes |
+| :--- | :--- | :--- |
+| **alloy** | Neutral | Default voice, balanced tone |
+| echo | Male | Clear and articulate |
+| fable | Male | Expressive, storytelling style |
+| onyx | Male | Deep and authoritative |
+| nova | Female | Warm and friendly |
+| shimmer | Female | Soft and gentle |
+
+#### Models
+
+| Model | Quality | Cost (per 1M chars) | Notes |
+| :--- | :--- | :--- | :--- |
+| tts-1 | Standard | $15 | Fast, default model |
+| tts-1-hd | High definition | $30 | Higher quality, slightly slower |
+| gpt-4o-mini-tts | Enhanced | Varies | Uses GPT-4o-mini for more natural speech |
+
+The current implementation uses `tts-1` by default for best speed-to-cost ratio.
+
+#### Pricing
+
+- **tts-1**: $15.00 per 1 million characters
+- **tts-1-hd**: $30.00 per 1 million characters
+- **gpt-4o-mini-tts**: Pricing varies
+
+For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs approximately $0.45 with tts-1.
+
+#### Limitations
+
+- **No word-level timing**: OpenAI TTS does not provide word-level timing metadata. The reader automatically switches to sentence-level highlighting for this provider.
+- **Internet required**: Audio generation requires an active internet connection.
+- **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
+- **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
