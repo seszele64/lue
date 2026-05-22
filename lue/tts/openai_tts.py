@@ -7,7 +7,7 @@ from .. import config
 
 
 class OpenAITTS(TTSBase):
-    """TTS implementation for OpenAI's Speech API."""
+    """TTS implementation for OpenAI's Speech API (and compatible endpoints)."""
 
     @property
     def name(self) -> str:
@@ -25,6 +25,7 @@ class OpenAITTS(TTSBase):
     def __init__(self, console: Console, voice: str = None, lang: str = None):
         super().__init__(console, voice, lang)
         self.client = None
+        self._model = os.environ.get("OPENAI_TTS_MODEL", "tts-1")
         if self.voice is None:
             self.voice = config.TTS_VOICES.get(self.name)
 
@@ -53,7 +54,12 @@ class OpenAITTS(TTSBase):
             logging.error("OPENAI_API_KEY is not set.")
             return False
 
-        self.client = AsyncOpenAI(api_key=api_key)
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        if base_url:
+            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        else:
+            self.client = AsyncOpenAI(api_key=api_key)
+
         self.initialized = True
         self.console.print("[green]OpenAI TTS model is available.[/green]")
         return True
@@ -63,13 +69,13 @@ class OpenAITTS(TTSBase):
         if not self.initialized:
             raise RuntimeError("OpenAI TTS has not been initialized.")
         try:
-            response = await self.client.audio.speech.create(
-                model="tts-1",
+            async with self.client.audio.speech.with_streaming_response.create(
+                model=self._model,
                 voice=self.voice,
                 input=text,
                 response_format="mp3",
-            )
-            await response.stream_to_file(output_path)
+            ) as response:
+                await response.stream_to_file(output_path)
         except Exception as e:
             logging.error(
                 f"OpenAI TTS audio generation failed for text: '{text[:50]}...'",
