@@ -30,7 +30,7 @@ def clean_tts_text(text: str) -> str:
     text = re.sub(r'(?:^|\s)[.,:;!?]+(?=\s|$)', ' ', text)
     
     # Remove standalone dashes that are followed by quotation marks
-    # This prevents TTS engines from reading "-" as "dash" in cases like: -" 
+    # This prevents TTS engines from reading "-" as "dash" in cases like: -"
     text = re.sub(r'(?:^|\s)-(?=")', ' ', text)
     
     # Clean up any extra whitespace that might result from removing punctuation
@@ -88,7 +88,15 @@ async def stop_and_clear_audio(reader):
                 except OSError:
                     if attempt < 4: 
                         await asyncio.sleep(0.1)  # Longer delay
-            
+    
+    # Clean up any remaining lookahead temp files
+    import glob
+    for la_file in glob.glob(os.path.join(config.LOOKAHEAD_TEMP_DIR, "la_*")):
+        try:
+            if os.path.isfile(la_file):
+                os.remove(la_file)
+        except OSError:
+            pass
 
     
     await asyncio.sleep(0.2)  # Longer final delay
@@ -105,7 +113,7 @@ async def get_audio_duration(file_path):
     except (ValueError, TypeError): return None
 
 async def play_from_current_position(reader):
-    """Start the audio producer and player loops."""
+    """Start the audio producer and player loops using LookaheadBuffer."""
     if not reader.is_paused and reader.running and reader.tts_model:
         # Cancel existing tasks and wait for them to complete
         for task in [reader.producer_task, reader.player_task]:
@@ -123,125 +131,74 @@ async def play_from_current_position(reader):
         # Small delay to ensure cleanup is complete
         await asyncio.sleep(0.05)
         
-        reader.producer_task = asyncio.create_task(_producer_loop(reader))
+        # Create lookahead buffer
+        from .lookahead_buffer import LookaheadBuffer
+        reader.lookahead_buffer = LookaheadBuffer(
+            reader,
+            target_sentences=config.LOOKAHEAD_SENTENCES,
+            min_start_items=config.PREBUFFER_MIN_ITEMS,
+            max_errors=config.LOOKAHEAD_MAX_ERRORS,
+        )
+        reader.tts_cache = getattr(reader, 'tts_cache', None)
+        reader.producer_task = reader.lookahead_buffer.start_producer()
+        
+        # Wait for pre-buffer threshold before starting the player.
+        # Two thresholds: minimum item count OR minimum seconds of audio,
+        # whichever is reached first (plus a 30-second safety timeout).
+        import time as _time
+        _buffer_start = _time.monotonic()
+        _total_duration_buffered = 0.0
+        while (reader.running 
+               and reader.lookahead_buffer.qsize < config.PREBUFFER_MIN_ITEMS
+               and _total_duration_buffered < config.PREBUFFER_MIN_SECONDS
+               and reader.lookahead_buffer._is_running
+               and not reader.producer_task.done()):
+            # Check accumulated audio duration from buffered items
+            _total_duration_buffered = getattr(
+                reader.lookahead_buffer, '_buffered_duration', 0.0
+            )
+            # 30-second safety timeout
+            if _time.monotonic() - _buffer_start > 30.0:
+                break
+            await asyncio.sleep(0.05)
+        
+        # Start player regardless of whether threshold was reached
         reader.player_task = asyncio.create_task(_player_loop(reader))
 
-async def _producer_loop(reader):
-    """Producer loop to generate audio files."""
-    if not reader.tts_model or not reader.tts_model.initialized:
-        try: await asyncio.wait_for(reader.audio_queue.put(None), timeout=0.5)
-        except (asyncio.TimeoutError, asyncio.CancelledError): pass
-        return
-
-    producer_pos = (reader.chapter_idx, reader.paragraph_idx, reader.sentence_idx)
-    buffer_index = 0
-    try:
-        while reader.running:
-            if reader.audio_queue.full():
-                await asyncio.sleep(0.1)
-                continue
-            try:
-                c, p, s = producer_pos
-                sentences = content_parser.split_into_sentences(reader.chapters[c][p])
-                text = sentences[s]
-            except IndexError: break
-            if not text or not text.strip():
-                next_pos = reader._advance_position(producer_pos, wrap=False)
-                if not next_pos: break
-                producer_pos = next_pos
-                continue
-
-            # --- Start of fragment merging logic ---
-            merged = False
-            # Heuristic: if a "sentence" is just an abbreviation, it might be a fragment.
-            # We check if the entire text matches common abbreviation patterns.
-            is_abbrev_fragment = re.fullmatch(ABBREVIATION_PATTERN, text.strip())
-
-            if is_abbrev_fragment and s + 1 < len(sentences):
-                text += " " + sentences[s+1]
-                merged = True
-            # --- End of fragment merging logic ---
-
-            # Preserve original text for UI display and timing calculation
-            original_text = text
-            
-            output_format = reader.tts_model.output_format
-            output_filename = f"{config.AUDIO_BUFFERS[buffer_index]}.{output_format}"
-            
-            try:
-                if not reader.running: break
-                
-                for attempt in range(3):
-                    try:
-                        if os.path.exists(output_filename): os.remove(output_filename)
-                        break
-                    except OSError:
-                        if attempt < 2: await asyncio.sleep(0.05)
-                
-                # Create sanitized version for TTS
-                sanitized_text = content_parser.sanitize_text_for_tts(original_text)
-                
-                timing_info = None
-                
-                # Use the timing-aware method if available
-                if hasattr(reader.tts_model, 'generate_audio_with_timing'):
-                    try:
-                        timing_info = await reader.tts_model.generate_audio_with_timing(sanitized_text, output_filename)
-                    except Exception as e:
-                        # If timing generation fails, fall back to generating without it
-                        logging.error(f"TTS timing generation failed for text '{original_text[:50]}...' (sanitized: '{sanitized_text[:50]}...'): {e}")
-                        await reader.tts_model.generate_audio(sanitized_text, output_filename)
-                else:
-                    # Fallback to regular method
-                    await reader.tts_model.generate_audio(sanitized_text, output_filename)
-
-                # Always get the actual duration from the file
-                duration = await get_audio_duration(output_filename)
-                
-                if not reader.running: break
-                
-                # If no timing info was generated, create a fallback structure
-                # Pass original_text to timing calculator for proper word mapping
-                if timing_info is None:
-                    from .timing_calculator import process_tts_timing_data
-                    timing_info = process_tts_timing_data(original_text, [], duration)
-                
-                await asyncio.wait_for(reader.audio_queue.put((output_filename, *producer_pos, duration, timing_info)), timeout=1.0)
-                
-                next_pos = reader._advance_position(producer_pos, wrap=False)
-                if merged:
-                    # If we merged two sentences, we must advance the position an extra time.
-                    if next_pos:
-                        next_pos = reader._advance_position(next_pos, wrap=False)
-
-                if not next_pos: break
-                producer_pos = next_pos
-                buffer_index = (buffer_index + 1) % len(config.AUDIO_BUFFERS)
-            except asyncio.CancelledError: break
-            except Exception as e:
-                if reader.running:
-                    # Include both original and sanitized text in error logging
-                    try:
-                        sanitized_for_log = content_parser.sanitize_text_for_tts(original_text) if 'original_text' in locals() else 'N/A'
-                        original_for_log = original_text if 'original_text' in locals() else 'N/A'
-                        logging.error(f"TTS Error in producer: {e}\nOriginal text: '{original_for_log[:100]}...'\nSanitized text: '{sanitized_for_log[:100]}...'", exc_info=True)
-                    except:
-                        logging.error(f"TTS Error in producer: {e}", exc_info=True)
-                    await asyncio.sleep(2)
-                continue
-    except asyncio.CancelledError: pass
-    finally:
-        try: await asyncio.wait_for(reader.audio_queue.put(None), timeout=0.5)
-        except (asyncio.TimeoutError, asyncio.CancelledError): pass
 
 async def _player_loop(reader):
-    """Player loop to play audio files."""
+    """Player loop to play audio files from the lookahead buffer."""
+    buf = getattr(reader, 'lookahead_buffer', None)
+    use_buffer = buf is not None
+
+    def mark_done():
+        """Call task_done on the appropriate queue."""
+        if use_buffer:
+            buf.task_done()
+        else:
+            try:
+                reader.audio_queue.task_done()
+            except ValueError:
+                pass  # too many task_done calls
+
+    async def signal_refill():
+        """Signal the lookahead buffer producer to refill."""
+        if use_buffer:
+            try:
+                await buf.signal_refill()
+            except Exception:
+                pass
+
     try:
         while reader.running:
             try:
-                item = await asyncio.wait_for(reader.audio_queue.get(), timeout=1.0)
+                if use_buffer:
+                    item = await buf.get()
+                else:
+                    item = await asyncio.wait_for(reader.audio_queue.get(), timeout=1.0)
+
                 if item is None:
-                    reader.audio_queue.task_done()
+                    mark_done()
                     if reader.active_playback_tasks:
                         await asyncio.gather(*reader.active_playback_tasks, return_exceptions=True)
                     reader.playback_finished_event.set()
@@ -257,10 +214,12 @@ async def _player_loop(reader):
                 word_timings = timing_info.get("word_timings", [])
                 
                 if not os.path.exists(audio_file):
-                    reader.audio_queue.task_done()
+                    mark_done()
+                    await signal_refill()
                     continue
                 if duration is None or duration <= 0:
-                    reader.audio_queue.task_done()
+                    mark_done()
+                    await signal_refill()
                     continue
                 try:
                     # Post a command to the main loop to handle the state transition atomically
@@ -269,7 +228,7 @@ async def _player_loop(reader):
                         ('_new_sentence_started', (c, p, s, duration, timing_data))
                     )
                 except RuntimeError:
-                    reader.audio_queue.task_done()
+                    mark_done()
                     break
                 try:
                     # Build ffplay command with speed control using atempo filter
@@ -277,8 +236,6 @@ async def _player_loop(reader):
                     
                     # Add atempo filter if speed is not 1.0
                     if abs(reader.playback_speed - 1.0) > 0.01:
-                        # atempo filter has limitations: must be between 0.5 and 2.0
-                        # For speeds outside this range, we chain multiple atempo filters
                         speed = reader.playback_speed
                         filters = []
                         
@@ -299,7 +256,8 @@ async def _player_loop(reader):
                     process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     reader.playback_processes.append(process)
                 except Exception:
-                    reader.audio_queue.task_done()
+                    mark_done()
+                    await signal_refill()
                     continue
 
                 async def await_and_remove(proc, file):
@@ -324,7 +282,6 @@ async def _player_loop(reader):
                 reader.active_playback_tasks.append(playback_task)
                 
                 # Calculate dynamic overlap based on playback speed
-                # Overlap should decrease as speed increases, reaching 0 at 3.00x speed and beyond
                 base_overlap = config.OVERLAP_SECONDS
                 if reader.tts_model and hasattr(reader.tts_model, 'get_overlap_seconds'):
                     tts_overlap = reader.tts_model.get_overlap_seconds()
@@ -332,15 +289,10 @@ async def _player_loop(reader):
                         base_overlap = tts_overlap
                 
                 # Apply speed-based overlap reduction
-                # At 1.0x speed: full overlap
-                # At 3.00x speed and above: 0 overlap
-                # Linear decrease between 1.0x and 3.0x
                 speed = reader.playback_speed
                 if speed >= 3.0:
                     overlap_seconds = 0.0
                 else:
-                    # Calculate overlap as a linear function decreasing from base_overlap to 0
-                    # as speed increases from 1.0 to 3.0
                     overlap_factor = max(0.0, min(1.0, (3.0 - speed) / (3.0 - 1.0)))
                     overlap_seconds = base_overlap * overlap_factor
                 
@@ -348,7 +300,8 @@ async def _player_loop(reader):
                 actual_duration = duration / speed
                 
                 await asyncio.sleep(max(0.1, actual_duration - overlap_seconds))
-                reader.audio_queue.task_done()
+                mark_done()
+                await signal_refill()
             except asyncio.TimeoutError:
                 if not reader.running: break
                 continue
