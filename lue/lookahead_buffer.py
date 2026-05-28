@@ -69,6 +69,9 @@ class LookaheadBuffer:
             reader.sentence_idx,
         )
 
+        # Parallel TTS generator (lazy init in _refill)
+        self._parallel_gen = None
+
         # Task handle
         self._producer_task: Optional[asyncio.Task] = None
 
@@ -117,6 +120,14 @@ class LookaheadBuffer:
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
         self._producer_task = None
+
+        # Shut down parallel generator if it was created
+        if self._parallel_gen is not None:
+            try:
+                await self._parallel_gen.shutdown()
+            except Exception:
+                pass
+            self._parallel_gen = None
 
         # Drain queue
         while not self._queue.empty():
@@ -188,7 +199,43 @@ class LookaheadBuffer:
     # --- Producer internals -------------------------------------------
 
     async def _refill(self) -> None:
-        """Main producer loop — sequential TTS generation."""
+        """Main producer loop with optional parallel batch generation."""
+
+        # --- Lazy init parallel generator ---
+        parallel_gen = None
+        max_concurrent = 1
+        if config.TTS_PARALLEL_ENABLED:
+            try:
+                from .tts_parallel import ParallelTTSGen
+
+                parallel_gen = ParallelTTSGen(
+                    reader=self._reader,
+                    tts_model=self._reader.tts_model,
+                    cache=getattr(self._reader, "tts_cache", None),
+                )
+                max_concurrent = parallel_gen._max_concurrent
+                log.info(
+                    "ParallelTTSGen initialized (max_concurrent=%d)", max_concurrent
+                )
+            except ImportError as e:
+                log.warning(
+                    "Parallel TTS import failed: %s — falling back to sequential", e
+                )
+            except Exception as e:
+                log.warning(
+                    "Parallel TTS init failed: %s — falling back to sequential", e
+                )
+
+        # Store on self so stop() can shut it down
+        self._parallel_gen = parallel_gen
+
+        log.debug(
+            "LookaheadBuffer refill loop starting (parallel=%s)",
+            parallel_gen is not None,
+        )
+
+        is_parallel = parallel_gen is not None
+
         try:
             while self._is_running:
                 # If queue is at target, wait for consumer to free slots
@@ -202,18 +249,36 @@ class LookaheadBuffer:
                     await self._put_sentinel()
                     break
 
-                # Generate next sentence sequentially
-                success = await self._generate_and_enqueue()
-                if not success and self._error_count >= self._max_errors:
-                    log.critical(
-                        "LookaheadBuffer: %d consecutive errors, stopping",
-                        self._error_count,
+                if is_parallel:
+                    # === PARALLEL PATH ===
+                    success = await self._refill_batch_parallel(
+                        parallel_gen, max_concurrent
                     )
-                    await self._put_sentinel()
-                    break
+                    if not success and self._error_count >= self._max_errors:
+                        log.critical(
+                            "LookaheadBuffer: %d consecutive errors, stopping",
+                            self._error_count,
+                        )
+                        await self._put_sentinel()
+                        break
+                else:
+                    # === SEQUENTIAL PATH (existing) ===
+                    success = await self._generate_and_enqueue()
+                    if not success and self._error_count >= self._max_errors:
+                        log.critical(
+                            "LookaheadBuffer: %d consecutive errors, stopping",
+                            self._error_count,
+                        )
+                        await self._put_sentinel()
+                        break
 
         except asyncio.CancelledError:
             log.debug("LookaheadBuffer refill cancelled")
+            if parallel_gen is not None:
+                try:
+                    await parallel_gen.shutdown()
+                except Exception:
+                    pass
         except Exception as e:
             log.error("LookaheadBuffer refill error: %s", e, exc_info=True)
         finally:
@@ -271,6 +336,99 @@ class LookaheadBuffer:
             self._is_at_end = True
         else:
             self._lookahead_pos = next_pos
+
+    async def _refill_batch_parallel(
+        self, parallel_gen, max_concurrent: int
+    ) -> bool:
+        """Batch-submit sentences to ParallelTTSGen, dispatch, and drain results.
+
+        Returns True if at least one sentence was successfully enqueued,
+        False if all failed.
+        """
+        remaining = self._target - self._qsize_safe()
+        batch_size = min(remaining, max_concurrent * 2)
+
+        # --- Collect batch: extract sentence texts with fragment merging ---
+        batch: list[tuple] = []  # [(sentence_pos, text, is_merged), ...]
+        pos = self._lookahead_pos
+        for _ in range(batch_size):
+            text, next_pos, merged = self._extract_sentence_text(pos)
+            if text is None:
+                # End of book
+                self._is_at_end = True
+                break
+            batch.append((pos, text, merged))
+            if next_pos is None:
+                self._is_at_end = True
+                break
+            pos = next_pos
+
+        if not batch:
+            if self._is_at_end:
+                await self._put_sentinel()
+            return False
+
+        # --- Submit batch ---
+        for sentence_pos, text, _merged in batch:
+            parallel_gen.submit(sentence_pos, text)
+
+        # --- Dispatch ---
+        await parallel_gen.dispatch()
+
+        # --- Drain results in order ---
+        any_success = False
+        for idx, (sentence_pos, _, merged) in enumerate(batch):
+            try:
+                result = await parallel_gen.drain_next()
+            except Exception as e:
+                log.error("drain_next failed: %s", e)
+                self._error_count += 1
+                # Advance position
+                self._advance_past(sentence_pos, merged)
+                continue
+
+            if result is None:
+                # Buffer drained unexpectedly — means shutdown or end
+                break
+
+            if result.success:
+                # Enqueue the result item
+                c, p, s = result.sentence_idx
+                item = (
+                    result.audio_path,
+                    c,
+                    p,
+                    s,
+                    result.duration,
+                    result.timing_info,
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._queue.put(item),
+                        timeout=1.0,
+                    )
+                    self._buffered_duration += result.duration
+                    self._error_count = 0
+                    any_success = True
+                except asyncio.TimeoutError:
+                    log.error(
+                        "Queue put timeout for sentence %s", result.sentence_idx
+                    )
+                    self._error_count += 1
+            else:
+                # Failed result — skip this sentence
+                self._error_count += 1
+                log.warning(
+                    "Skipping failed sentence %s (error %d/%d)",
+                    result.sentence_idx,
+                    self._error_count,
+                    self._max_errors,
+                )
+
+            # Advance position (accounting for merged fragments)
+            self._advance_past(sentence_pos, merged)
+
+        return any_success
 
     async def _generate_and_enqueue(self) -> bool:
         """Generate one sentence at self._lookahead_pos and enqueue it.
