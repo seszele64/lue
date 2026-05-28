@@ -4,6 +4,7 @@ import re
 import subprocess
 import logging
 from . import config, content_parser
+from .tts_pipeline import create_pipeline
 
 # This pattern is used to both clean text for TTS and detect sentence fragments.
 ABBREVIATION_PATTERN = r'\b(Mr|Mrs|Ms|Dr|Prof|Rev|Hon|Jr|Sr|Cpl|Sgt|Gen|Col|Capt|Lt|Pvt|vs|viz|Co|Inc|Ltd|Corp|St|Ave|Blvd)\.'
@@ -30,7 +31,7 @@ def clean_tts_text(text: str) -> str:
     text = re.sub(r'(?:^|\s)[.,:;!?]+(?=\s|$)', ' ', text)
     
     # Remove standalone dashes that are followed by quotation marks
-    # This prevents TTS engines from reading "-" as "dash" in cases like: -"
+    # This prevents TTS engines from reading "-" as "dash" in cases like: -" 
     text = re.sub(r'(?:^|\s)-(?=")', ' ', text)
     
     # Clean up any extra whitespace that might result from removing punctuation
@@ -73,6 +74,14 @@ async def stop_and_clear_audio(reader):
             reader.audio_queue.get_nowait()
             reader.audio_queue.task_done()
         except asyncio.QueueEmpty: break
+    
+    # Stop TTS pipeline (buffer → parallel, cleans temp files)
+    if hasattr(reader, 'pipeline') and reader.pipeline is not None:
+        try:
+            await reader.pipeline.stop()
+        except Exception:
+            pass
+        reader._pipeline_state = reader.pipeline.state.name
     
     await asyncio.sleep(0.1)
     
@@ -131,16 +140,12 @@ async def play_from_current_position(reader):
         # Small delay to ensure cleanup is complete
         await asyncio.sleep(0.05)
         
-        # Create lookahead buffer
-        from .lookahead_buffer import LookaheadBuffer
-        reader.lookahead_buffer = LookaheadBuffer(
-            reader,
-            target_sentences=config.LOOKAHEAD_SENTENCES,
-            min_start_items=config.PREBUFFER_MIN_ITEMS,
-            max_errors=config.LOOKAHEAD_MAX_ERRORS,
-        )
-        reader.tts_cache = getattr(reader, 'tts_cache', None)
-        reader.producer_task = reader.lookahead_buffer.start_producer()
+        # Create unified TTS pipeline (TTSCache → ParallelTTSGen → LookaheadBuffer)
+        reader.pipeline = create_pipeline(reader)
+        reader.tts_cache = reader.pipeline.cache
+        reader.lookahead_buffer = reader.pipeline.buffer
+        reader.producer_task = reader.pipeline.start()
+        reader._pipeline_state = reader.pipeline.state.name
         
         # Wait for pre-buffer threshold before starting the player.
         # Two thresholds: minimum item count OR minimum seconds of audio,
@@ -163,6 +168,7 @@ async def play_from_current_position(reader):
             await asyncio.sleep(0.05)
         
         # Start player regardless of whether threshold was reached
+        # (producer may have finished early or reader may have been stopped)
         reader.player_task = asyncio.create_task(_player_loop(reader))
 
 

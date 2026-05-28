@@ -84,6 +84,9 @@ TTS_MAX_CONCURRENT = _tts_max_raw
 
 TTS_MAX_CONCURRENT_FALLBACK = 1
 
+# TTS pipeline UI settings
+SHOW_BUFFER_STATUS = os.environ.get("LUE_SHOW_BUFFER_STATUS", "").lower() in ("1", "true", "yes")
+
 OVERLAP_SECONDS = 0.5  # Seconds of overlap between sentences
 
 # Progress tracking settings
