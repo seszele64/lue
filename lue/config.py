@@ -28,6 +28,14 @@ AUDIO_DATA_DIR = user_cache_dir("lue")
 os.makedirs(AUDIO_DATA_DIR, exist_ok=True)
 AUDIO_BUFFERS = [os.path.join(AUDIO_DATA_DIR, f"buffer_{i}") for i in range(6)]
 MAX_QUEUE_SIZE = 4
+
+# TTS cache settings
+TTS_CACHE_ENABLED = True  # When False, skip all cache operations
+TTS_CACHE_DIR = os.path.join(AUDIO_DATA_DIR, "tts_cache")
+os.makedirs(TTS_CACHE_DIR, exist_ok=True)
+TTS_CACHE_MAX_SIZE_MB = 100
+TTS_CACHE_MAX_SIZE_BYTES = TTS_CACHE_MAX_SIZE_MB * 1024 * 1024
+
 OVERLAP_SECONDS = 0.5  # Seconds of overlap between sentences
 
 # Progress tracking settings

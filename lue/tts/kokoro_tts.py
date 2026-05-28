@@ -232,15 +232,15 @@ class KokoroTTS(TTSBase):
         # Get raw timing data (which also generates the audio)
         raw_timings = await self.get_raw_timing_data(text, output_path)
         
-        # Get actual audio duration
-        try:
-            from .. import audio
-        except ImportError:
-            import sys
-            import os
-            sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-            import audio
-        duration = await audio.get_audio_duration(output_path)
+        # Compute duration from raw timings or file size (no ffprobe needed).
+        # Kokoro generates WAV at 24000 Hz, 32-bit float = 4 bytes per sample.
+        if raw_timings:
+            duration = raw_timings[-1][2] + 0.15
+        elif os.path.isfile(output_path):
+            file_size = os.path.getsize(output_path)
+            duration = file_size / (24000 * 4)
+        else:
+            duration = 3.0
         
         # Process timing data using the centralized calculator
         try:
