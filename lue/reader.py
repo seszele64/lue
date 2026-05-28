@@ -43,7 +43,10 @@ class Lue:
         self.audio_restart_lock = asyncio.Lock()
         self.pending_restart_task = None
         self.playback_speed = 1.0  # Default speed multiplier
-        
+
+        # TTS pipeline state
+        self._pipeline_state = "IDLE"  # pipeline lifecycle state
+
         # Add pause toggle lock and task tracking
         self.pause_toggle_lock = asyncio.Lock()
         self.current_pause_toggle_task = None
@@ -61,6 +64,34 @@ class Lue:
         self.chapter_index_panel_y = 0
         self.chapter_index_panel_width = 0
         self.chapter_index_panel_height = 0
+
+    @property
+    def pipeline_state(self) -> str:
+        """Current pipeline lifecycle state: IDLE, BUFFERING, PLAYING, PAUSED, FINISHED, ERROR.
+
+        Returns 'UNINITIALIZED' if no pipeline has been created yet.
+        """
+        return getattr(self, '_pipeline_state', 'UNINITIALIZED')
+
+    @property
+    def buffer_depth(self) -> str:
+        """Display string for buffer fill level (e.g., '28/30').
+
+        O(1), non-blocking read. Returns '--' when not applicable.
+        """
+        if not config.SHOW_BUFFER_STATUS:
+            return ""
+
+        buf = getattr(self, 'lookahead_buffer', None)
+        if buf is None:
+            return ""
+
+        try:
+            current = buf.qsize
+            target = buf._target
+            return f"{current}/{target}"
+        except Exception:
+            return ""
 
     def _initialize_tts(self, tts_model):
         """Initialize TTS-related state."""
