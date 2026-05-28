@@ -69,6 +69,7 @@ class _OrderedBuffer:
         self._next_pos: int = 0
         self._submission_counter: int = 0
         self._pending_count: int = 0
+        self._expected_total: int = 0
         self._event: asyncio.Event = asyncio.Event()
         self._lock: asyncio.Lock = asyncio.Lock()
 
@@ -112,8 +113,8 @@ class _OrderedBuffer:
                         self._event.clear()
                     return result
 
-                # No pending items at all → drained
-                if self._pending_count == 0:
+                # All expected items have been drained
+                if self._next_pos >= self._expected_total:
                     return None
 
             # Wait for the next completion
@@ -134,6 +135,7 @@ class _OrderedBuffer:
         self._next_pos = 0
         self._submission_counter = 0
         self._pending_count = 0
+        self._expected_total = 0
         # Replace the event so any waiting pop_next gets a fresh start.
         self._event = asyncio.Event()
 
@@ -265,6 +267,8 @@ class ParallelTTSGen:
         """
         items = self._pending[:]
         self._pending.clear()
+
+        self._buffer._expected_total += len(items)
 
         for sentence_idx, text in items:
             task = asyncio.create_task(self._generate_one(sentence_idx, text))
