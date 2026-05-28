@@ -1,4 +1,6 @@
+import asyncio
 import os
+import random
 import logging
 from rich.console import Console
 
@@ -65,23 +67,151 @@ class OpenAITTS(TTSBase):
         return True
 
     async def generate_audio(self, text: str, output_path: str):
-        """Generate audio from text using OpenAI Speech API and save to file."""
+        """Generate audio from text using OpenAI Speech API and save to file.
+
+        Applies per-request timeout and exponential-backoff retry for
+        transient failures (timeouts, server errors, rate limits).
+        """
         if not self.initialized:
             raise RuntimeError("OpenAI TTS has not been initialized.")
-        try:
-            async with self.client.audio.speech.with_streaming_response.create(
-                model=self._model,
-                voice=self.voice,
-                input=text,
-                response_format="mp3",
-            ) as response:
-                await response.stream_to_file(output_path)
-        except Exception as e:
-            logging.error(
-                f"OpenAI TTS audio generation failed for text: '{text[:50]}...'",
-                exc_info=True,
+
+        from ..config import OPENAI_TTS_TIMEOUT, OPENAI_TTS_MAX_RETRIES, OPENAI_TTS_RETRY_BASE_DELAY
+
+        last_exception = None
+
+        for attempt in range(OPENAI_TTS_MAX_RETRIES + 1):
+            try:
+                async def _do_request():
+                    """Execute the full TTS request inside the timeout scope."""
+                    async with self.client.audio.speech.with_streaming_response.create(
+                        model=self._model,
+                        voice=self.voice,
+                        input=text,
+                        response_format="mp3",
+                    ) as response:
+                        await response.stream_to_file(output_path)
+
+                await asyncio.wait_for(
+                    _do_request(),
+                    timeout=OPENAI_TTS_TIMEOUT,
+                )
+                # Success — return immediately
+                if attempt > 0:
+                    logging.info(
+                        "OpenAI TTS recovered after %d retries for '%s...'",
+                        attempt,
+                        text[:50],
+                    )
+                return
+
+            except asyncio.TimeoutError:
+                last_exception = asyncio.TimeoutError(
+                    f"OpenAI TTS timed out after {OPENAI_TTS_TIMEOUT}s "
+                    f"for text: '{text[:50]}...'"
+                )
+            except Exception as e:
+                last_exception = e
+
+            # --- Should we retry? -----------------------------------------
+            if not self._should_retry(last_exception):
+                # Non-retryable error — re-raise immediately
+                logging.error(
+                    "OpenAI TTS non-retryable error (attempt %d/%d) "
+                    "for '%s...': %s",
+                    attempt + 1,
+                    OPENAI_TTS_MAX_RETRIES + 1,
+                    text[:50],
+                    last_exception,
+                    exc_info=True,
+                )
+                raise last_exception
+
+            # --- Exhausted retries? ---------------------------------------
+            if attempt >= OPENAI_TTS_MAX_RETRIES:
+                logging.error(
+                    "OpenAI TTS exhausted %d retries for '%s...': %s",
+                    OPENAI_TTS_MAX_RETRIES + 1,
+                    text[:50],
+                    last_exception,
+                    exc_info=True,
+                )
+                raise last_exception
+
+            # --- Backoff and retry ----------------------------------------
+            delay = OPENAI_TTS_RETRY_BASE_DELAY * (2 ** attempt)
+            jitter = delay * 0.25 * (2 * random.random() - 1)  # ±25%
+            wait_time = max(0.1, delay + jitter)
+
+            logging.warning(
+                "OpenAI TTS retry %d/%d in %.1fs for '%s...': %s",
+                attempt + 1,
+                OPENAI_TTS_MAX_RETRIES,
+                wait_time,
+                text[:50],
+                type(last_exception).__name__,
             )
-            raise
+            await asyncio.sleep(wait_time)
+
+    @staticmethod
+    def _should_retry(exc: Exception) -> bool:
+        """Return True if the exception should trigger a retry.
+
+        Retries on:
+        - asyncio.TimeoutError (our own per-request timeout)
+        - httpx.TimeoutException (connection-level timeout)
+        - httpx.ConnectError, httpx.RemoteProtocolError (network issues)
+        - HTTP 429 rate limit (from httpx.HTTPStatusError)
+        - HTTP 5xx server errors (from httpx.HTTPStatusError)
+        - SSLError, ConnectionResetError, BrokenPipeError (network issues)
+        """
+        exc_name = type(exc).__name__
+
+        # Our per-request timeout
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+
+        # httpx-specific network errors
+        if exc_name in (
+            "TimeoutException",
+            "ConnectError",
+            "ConnectTimeout",
+            "ReadTimeout",
+            "WriteTimeout",
+            "PoolTimeout",
+            "RemoteProtocolError",
+            "NetworkError",
+        ):
+            return True
+
+        # Transport-level errors
+        if isinstance(exc, (ConnectionError, BrokenPipeError)):
+            return True
+
+        # SSL errors
+        try:
+            from ssl import SSLError
+            if isinstance(exc, SSLError):
+                return True
+        except ImportError:
+            pass
+
+        # HTTP status code errors (429 rate limit, 5xx server errors)
+        if hasattr(exc, "status_code"):
+            status = getattr(exc, "status_code", None)
+            if status is not None:
+                if status == 429 or (500 <= status < 600):
+                    return True
+                return False  # 4xx (except 429) are non-retryable
+
+        # Check if it wraps an httpx.HTTPStatusError
+        if exc_name in ("HTTPStatusError",):
+            if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+                status = exc.response.status_code
+                if status == 429 or (500 <= status < 600):
+                    return True
+            return False
+
+        return False
 
     async def get_raw_timing_data(self, text: str, output_path: str):
         """OpenAI TTS does not provide word-level timing data. Returns empty list."""

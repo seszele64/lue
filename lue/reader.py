@@ -1589,7 +1589,24 @@ class Lue:
         await audio.play_from_current_position(self)
 
         while self.running:
-            await self.command_received_event.wait()
+            # Check for spontaneous pipeline death (Bug 2)
+            if (self.player_task and self.player_task.done()
+                    and not self.playback_finished_event.is_set()):
+                logging.warning(
+                    "Player task died unexpectedly — forcing UI refresh"
+                )
+                self.playback_finished_event.set()
+                self.command = "_resize"
+                self.command_received_event.set()
+
+            # Use short timeout to periodically check for pipeline death
+            try:
+                await asyncio.wait_for(
+                    self.command_received_event.wait(), timeout=0.5
+                )
+            except asyncio.TimeoutError:
+                # No command yet — loop back to re-check player state
+                continue
             self.command_received_event.clear()
             cmd = self.command
             self.command = None

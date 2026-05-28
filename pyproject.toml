@@ -44,6 +44,10 @@ kokoro = [
 openai = [
     "openai>=1.0.0",
 ]
+test = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+]
 
 [project.scripts]
 lue = "lue.__main__:cli"
@@ -55,6 +59,14 @@ Issues = "https://github.com/superstarryeyes/lue/issues"
 
 [tool.setuptools.packages.find]
 include = ["lue*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "unit: Tests that verify individual functions/units in isolation",
+    "integration: Tests that verify interactions between multiple components",
+]
 
 [tool.setuptools.package-data]
 lue = ["py.typed", "guide.txt", "*.json"]
