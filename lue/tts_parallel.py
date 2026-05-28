@@ -75,16 +75,22 @@ class _OrderedBuffer:
 
     # -- Public API -------------------------------------------------------
 
-    async def submit(self, result: _GenerationResult) -> None:
+    async def submit(
+        self, result: _GenerationResult, index: int | None = None
+    ) -> None:
         """Submit a completed result.
 
-        The result is stored at the current ``_submission_counter`` index
-        (which is then incremented).  If this index matches ``_next_pos``
-        the internal event is signalled so that :meth:`pop_next` wakes up.
+        If *index* is provided, the result is stored at that index.
+        Otherwise the internal ``_submission_counter`` is used and
+        incremented (for cases where submission order IS the correct
+        ordering, e.g. sequential single-item dispatch).
         """
         async with self._lock:
-            idx = self._submission_counter
-            self._submission_counter += 1
+            if index is not None:
+                idx = index
+            else:
+                idx = self._submission_counter
+                self._submission_counter += 1
             self._buffer[idx] = result
             self._pending_count += 1
 
@@ -262,8 +268,9 @@ class ParallelTTSGen:
     async def dispatch(self) -> None:
         """Spawn worker tasks for all currently pending sentences.
 
-        Logs the number of sentences dispatched.  Workers are created via
-        :func:`asyncio.create_task` and tracked in ``_worker_tasks``.
+        Pre-assigns submission indexes from ``_buffer._submission_counter``
+        so that workers store results in dispatch order regardless of which
+        worker completes first.
         """
         items = self._pending[:]
         self._pending.clear()
@@ -271,7 +278,14 @@ class ParallelTTSGen:
         self._buffer._expected_total += len(items)
 
         for sentence_idx, text in items:
-            task = asyncio.create_task(self._generate_one(sentence_idx, text))
+            # Pre-assign the submission index before spawning the worker.
+            # This ensures the ordered buffer returns results in dispatch
+            # order, not completion order.
+            idx = self._buffer._submission_counter
+            self._buffer._submission_counter += 1
+            task = asyncio.create_task(
+                self._generate_one(sentence_idx, text, idx)
+            )
             self._worker_tasks.append(task)
 
         log.info(
@@ -323,12 +337,20 @@ class ParallelTTSGen:
 
     # -- Internal helpers -------------------------------------------------
 
-    async def _generate_one(self, sentence_idx: tuple, text: str) -> None:
+    async def _generate_one(
+        self, sentence_idx: tuple, text: str, order_idx: int
+    ) -> None:
         """Core worker: check cache, acquire semaphore, generate, submit.
 
         If a cache hit occurs the result is submitted immediately without
         consuming a semaphore slot.  Otherwise the semaphore is acquired
         for TTS generation.
+
+        Parameters
+        ----------
+        order_idx:
+            Pre-assigned dispatch-order index used to place the result
+            in the correct position in ``_OrderedBuffer``.
         """
         sanitized = content_parser.sanitize_text_for_tts(text)
 
@@ -344,7 +366,7 @@ class ParallelTTSGen:
                         timing_info=hit.timing_info,
                         success=True,
                     )
-                    await self._buffer.submit(result)
+                    await self._buffer.submit(result, index=order_idx)
                     return
             except Exception:
                 log.warning("Cache lookup failed for '%s...'", text[:50])
@@ -428,7 +450,7 @@ class ParallelTTSGen:
                     timing_info=timing_info,
                     success=True,
                 )
-                await self._buffer.submit(result)
+                await self._buffer.submit(result, index=order_idx)
                 self._error_count = 0
 
             except asyncio.CancelledError:
@@ -466,7 +488,7 @@ class ParallelTTSGen:
                     timing_info={},
                     success=False,
                 )
-                await self._buffer.submit(result)
+                await self._buffer.submit(result, index=order_idx)
 
     async def _generate_one_sequential(
         self, sentence_idx: tuple, text: str
