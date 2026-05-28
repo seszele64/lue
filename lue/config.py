@@ -64,6 +64,26 @@ for stale_file in os.listdir(LOOKAHEAD_TEMP_DIR):
         except OSError:
             pass
 
+# ═══════════════════════════════════════════════════════════════════════════
+# TTS Pipeline Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+# These settings control the audio generation and playback pipeline.
+# See LOOKAHEAD_TEMP_DIR for session temp files.
+
+_tts_parallel_raw = os.environ.get("LUE_TTS_PARALLEL_ENABLED", "True")
+TTS_PARALLEL_ENABLED = _tts_parallel_raw.lower() not in ("0", "false", "no")
+
+_tts_max_raw = int(os.environ.get("LUE_TTS_MAX_CONCURRENT", "3"))
+if _tts_max_raw < 1:
+    _log.warning("LUE_TTS_MAX_CONCURRENT=%d clamped to lower bound 1", _tts_max_raw)
+    _tts_max_raw = 1
+elif _tts_max_raw > 8:
+    _log.warning("LUE_TTS_MAX_CONCURRENT=%d clamped to upper bound 8", _tts_max_raw)
+    _tts_max_raw = 8
+TTS_MAX_CONCURRENT = _tts_max_raw
+
+TTS_MAX_CONCURRENT_FALLBACK = 1
+
 OVERLAP_SECONDS = 0.5  # Seconds of overlap between sentences
 
 # Progress tracking settings
