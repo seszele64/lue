@@ -32,7 +32,7 @@ MAX_QUEUE_SIZE = 12
 
 # Pre-buffering settings (controls when playback starts)
 # Playback begins once either threshold is reached
-PREBUFFER_MIN_ITEMS = 3       # Minimum sentences to pre-generate
+PREBUFFER_MIN_ITEMS = 4       # Minimum sentences to pre-generate
 PREBUFFER_MIN_SECONDS = 10.0  # Minimum seconds of audio to pre-generate
 
 # TTS cache settings
@@ -83,6 +83,22 @@ elif _tts_max_raw > 8:
 TTS_MAX_CONCURRENT = _tts_max_raw
 
 TTS_MAX_CONCURRENT_FALLBACK = 1
+
+# OpenAI TTS retry settings
+# Per-request generation timeout (seconds). Requests that exceed this
+# are cancelled and retried if retries remain.
+_tts_timeout_raw = float(os.environ.get("LUE_OPENAI_TTS_TIMEOUT", "30"))
+OPENAI_TTS_TIMEOUT = max(_tts_timeout_raw, 5.0) if _tts_timeout_raw > 0 else 30.0
+
+# Maximum retry attempts for transient failures (timeouts, connection
+# errors, server errors, rate limits).
+_tts_retries_raw = int(os.environ.get("LUE_OPENAI_TTS_MAX_RETRIES", "3"))
+OPENAI_TTS_MAX_RETRIES = max(min(_tts_retries_raw, 10), 0) if _tts_retries_raw >= 0 else 3
+
+# Base delay in seconds for exponential backoff.  Attempt n waits
+# base * 2**(n-1) seconds before retrying.
+_tts_retry_delay_raw = float(os.environ.get("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "1.0"))
+OPENAI_TTS_RETRY_BASE_DELAY = max(_tts_retry_delay_raw, 0.1) if _tts_retry_delay_raw > 0 else 1.0
 
 # TTS pipeline UI settings
 SHOW_BUFFER_STATUS = os.environ.get("LUE_SHOW_BUFFER_STATUS", "").lower() in ("1", "true", "yes")
