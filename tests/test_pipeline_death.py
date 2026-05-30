@@ -400,3 +400,139 @@ async def test_full_pipeline_error_to_sentinel_integration():
 
     # --- 9. Clean shutdown ---
     await gen.shutdown()
+
+
+# ============================================================================
+# Test 7: get() keeps waiting while producer is alive (slow TTS fix)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_keeps_waiting_while_producer_is_alive():
+    """get() does NOT return None just because the queue is empty for 2+ seconds.
+
+    The old get() had a hard 2s timeout before returning None. When TTS was
+    slow (queue empty for longer than 2s), this premature None was treated
+    as "end of book" by the player, causing permanent freeze.
+
+    The fix uses an infinite retry loop while _is_running is True.
+    """
+    from lue.lookahead_buffer import LookaheadBuffer
+
+    reader = type(
+        "MockReader",
+        (),
+        {
+            "chapter_idx": 0,
+            "paragraph_idx": 0,
+            "sentence_idx": 0,
+            "chapters": [["Test."]],
+            "tts_model": MagicMock(),
+            "tts_cache": None,
+            "_advance_position": (lambda self, pos, wrap=False: None),
+        },
+    )()
+
+    buffer = LookaheadBuffer(reader, target_sentences=1, max_errors=5)
+    buffer._is_running = True
+    buffer._producer_task = MagicMock()
+    buffer._producer_task.done.return_value = False  # producer is alive
+
+    # get() should block while _is_running is True (queue is empty, producer alive).
+    # Wrap in wait_for(..., timeout=0.5) — it should time out because get()
+    # keeps retrying, NOT return None.
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(buffer.get(), timeout=0.5)
+
+
+# ============================================================================
+# Test 8: get() returns None when producer is stopped
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_returns_none_when_producer_stopped():
+    """get() returns None promptly after _is_running becomes False."""
+    from lue.lookahead_buffer import LookaheadBuffer
+
+    reader = type(
+        "MockReader",
+        (),
+        {
+            "chapter_idx": 0,
+            "paragraph_idx": 0,
+            "sentence_idx": 0,
+            "chapters": [["Test."]],
+            "tts_model": MagicMock(),
+            "tts_cache": None,
+            "_advance_position": (lambda self, pos, wrap=False: None),
+        },
+    )()
+
+    buffer = LookaheadBuffer(reader, target_sentences=1, max_errors=5)
+    buffer._is_running = True
+    buffer._producer_task = MagicMock()
+    buffer._producer_task.done.return_value = False
+
+    # Schedule a task that stops the producer after a short delay.
+    async def stop_producer():
+        await asyncio.sleep(0.15)
+        buffer._is_running = False
+
+    asyncio.create_task(stop_producer())
+
+    # get() should return None within a short time after _is_running flips.
+    try:
+        result = await asyncio.wait_for(buffer.get(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("get() did not return None within 2s after _is_running=False")
+
+    assert result is None
+
+
+# ============================================================================
+# Test 9: get() returns None when producer task died unexpectedly
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_get_returns_none_when_producer_task_crashed():
+    """get() returns None when the producer task finishes unexpectedly.
+
+    This covers the edge case where the producer task crashes (done()=True)
+    without properly setting _is_running=False.
+    """
+    from lue.lookahead_buffer import LookaheadBuffer
+
+    reader = type(
+        "MockReader",
+        (),
+        {
+            "chapter_idx": 0,
+            "paragraph_idx": 0,
+            "sentence_idx": 0,
+            "chapters": [["Test."]],
+            "tts_model": MagicMock(),
+            "tts_cache": None,
+            "_advance_position": (lambda self, pos, wrap=False: None),
+        },
+    )()
+
+    buffer = LookaheadBuffer(reader, target_sentences=1, max_errors=5)
+    buffer._is_running = True
+    # Simulate producer task that has finished (crashed)
+    buffer._producer_task = MagicMock()
+    buffer._producer_task.done.return_value = True
+
+    # get() should detect the crashed producer and return None.
+    # Use timeout=2.0 to give the inner 1s queue.get() timeout
+    # enough time to fire cleanly without the outer wrapper
+    # cancelling the task before the result can propagate.
+    try:
+        result = await asyncio.wait_for(buffer.get(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            "get() did not return None within 2s when producer_task.done()=True"
+        )
+
+    assert result is None
