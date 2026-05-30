@@ -156,24 +156,34 @@ class LookaheadBuffer:
     async def get(self) -> Optional[QueueItem]:
         """Get the next audio item from the queue.
 
-        Returns None as a sentinel when the buffer is stopped or at
-        end-of-book. Raises asyncio.CancelledError if cancelled.
+        Blocks until an item is available, the producer is stopped,
+        or the producer task has finished unexpectedly. Returns
+        ``None`` only when the buffer is truly stopped or the
+        producer has exited.
+
+        Retries indefinitely (with 1s timeout) as long as the producer
+        is still running, preventing premature sentinel returns when
+        the TTS is simply slow.
         """
         if not self._is_running and self._queue.empty():
             return None
 
-        try:
-            item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
-            return item
-        except asyncio.TimeoutError:
-            if not self._is_running:
-                return None
-            # Still running but queue empty — retry
+        while self._is_running:
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=1.0)
                 return item
             except asyncio.TimeoutError:
-                return None
+                if not self._is_running:
+                    return None
+                # If the producer task has died unexpectedly
+                # (e.g., unhandled exception), break out.
+                if (self._producer_task is not None
+                        and self._producer_task.done()):
+                    return None
+                # Producer still running but queue is empty
+                # (TTS generation is slow) — keep waiting.
+                continue
+        return None
 
     def task_done(self) -> None:
         """Mark the current queue item as processed and signal the producer.
