@@ -47,9 +47,19 @@ def _get_highlightable_words(text: str) -> list[str]:
     # Split on whitespace to get tokens
     tokens = text.split()
     
-    # Strip punctuation from tokens and filter out pure punctuation
+    # Strip punctuation from tokens and filter out pure punctuation.
+    #
+    # A token only counts as a word if it contains at least one ASCII
+    # alphanumeric character. That is exactly the test `reader` applies when it
+    # builds `current_sentence_words` for highlighting, and the same test TTS
+    # engines apply when deciding what to speak. Without it, standalone
+    # non-ASCII punctuation ("™", "–", "•", "”") is counted here but not by the
+    # reader, so every word *after* it resolves to an index one too high and
+    # the highlight lands on the wrong word for the rest of the sentence.
     words = []
     for token in tokens:
+        if not re.search(r'[a-zA-Z0-9]', token):
+            continue
         cleaned = token.strip(string.punctuation)
         if cleaned:  # Only include non-empty cleaned tokens
             words.append(cleaned)
@@ -89,6 +99,234 @@ def _extract_core_word(token: str) -> str:
         return ""
 
 
+def _align_sanitized(orig: List[str], tts: List[str]) -> Optional[List[int]]:
+    """
+    Exactly align two ``_sanitize_word`` sequences.
+
+    The reader highlights tokens of the *original* sentence, but the TTS engine
+    speaks ``content_parser.sanitize_text_for_tts``'s rewrite of it, which
+
+    * splits hyphen- and dash-joined tokens into separate spoken words
+      (``word-another`` -> ``word another``, ``10-20`` -> ``10 20``,
+      ``past—it`` -> ``past it``) and
+    * can let a single spoken word cover several tokens.
+
+    Because both sides derive from the same string, the relationship is a
+    fact, not a guess: one original token is exactly the concatenation of the
+    spoken words it was split into. Walking both sequences by accumulated
+    concatenation recovers it, whereas guessing word by word (see the fuzzy
+    matcher below) drifts as soon as one token does not map 1:1 — a single
+    ``one-size-fits-all`` shifts every later word of the sentence by three.
+
+    Args:
+        orig: ``_sanitize_word`` output for each original token
+        tts: ``_sanitize_word`` output for each spoken word
+
+    Returns:
+        One TTS index per original token, or ``None`` when the sequences
+        cannot be aligned (caller then falls back to fuzzy matching).
+    """
+    mapping: List[int] = []
+    i = j = 0
+
+    while i < len(orig) and j < len(tts):
+        # Punctuation-only original token: no spoken word of its own.
+        if not orig[i]:
+            mapping.append(mapping[-1] if mapping else 0)
+            i += 1
+            continue
+        # Punctuation-only spoken word: nothing highlights it on its own,
+        # so leave it as an unmapped gap for the reader's owner lookup.
+        if not tts[j]:
+            j += 1
+            continue
+
+        # One original token split across several spoken words:
+        # accumulate spoken words while they still spell out the token.
+        acc, k = "", j
+        while k < len(tts):
+            cand = acc + tts[k]
+            if not orig[i].startswith(cand):
+                break
+            acc = cand
+            k += 1
+            if acc == orig[i]:
+                break
+        if k > j and acc == orig[i]:
+            mapping.append(j)
+            i += 1
+            j = k
+            continue
+
+        # One spoken word covering several original tokens.
+        acc, k = "", i
+        while k < len(orig):
+            cand = acc + orig[k]
+            if not tts[j].startswith(cand):
+                break
+            acc = cand
+            k += 1
+            if acc == tts[j]:
+                break
+        if k > i and acc == tts[j]:
+            mapping.extend([j] * (k - i))
+            i = k
+            j += 1
+            continue
+
+        return None
+
+    # Trailing unmatched entries on either side cannot be aligned.
+    if i != len(orig) or j != len(tts):
+        return None
+
+    return mapping
+
+
+def owner_word_index(word_mapping: List[int], tts_word_idx: int) -> int:
+    """
+    Resolve a spoken-word index to the original token that contains it.
+
+    ``word_mapping`` maps each original token to *one* spoken word — the first
+    of them when ``sanitize_text_for_tts`` split a hyphen- or dash-joined
+    token (``word-another`` -> ``word another``). Every later spoken word of
+    that token therefore has no entry of its own, and indexing the original
+    token list with the spoken-word index (the old behaviour) lands one or
+    more words ahead of what is actually being spoken.
+
+    Args:
+        word_mapping: original token index -> spoken word index
+        tts_word_idx: spoken word currently being spoken
+
+    Returns:
+        Index of the original token owning that spoken word.
+    """
+    owners = [orig_idx for orig_idx, mapped in enumerate(word_mapping)
+              if mapped <= tts_word_idx]
+    return owners[-1] if owners else 0
+
+
+def select_highlight_word(
+    word_timings: Optional[List[Tuple[str, float, float]]],
+    word_mapping: Optional[List[int]],
+    elapsed: float,
+    total_words: int,
+    sentence_duration: float = 0.0,
+) -> int:
+    """
+    Choose the token index to highlight at ``elapsed`` seconds of playback.
+
+    Pure extraction of the body of ``reader.Lue._word_update_loop``, kept here
+    so the selection can be tested without a running reader.
+
+    Args:
+        word_timings: (word, start, end) per spoken word, or ``None``/empty
+        word_mapping: original token index -> spoken word index, if any
+        elapsed: playback time adjusted for speed
+        total_words: number of tokens in the displayed sentence
+        sentence_duration: used to estimate timing when none is available
+
+    Returns:
+        Index into the displayed sentence's token list, clamped to range.
+    """
+    if total_words <= 0:
+        return 0
+
+    # No precise timings at all: distribute the sentence evenly.
+    if not word_timings:
+        if sentence_duration <= 0:
+            return 0
+        time_per_word = sentence_duration / total_words
+        return min(int(elapsed / time_per_word), total_words - 1)
+
+    # No mapping: trust the spoken word index (same index space assumption).
+    if not word_mapping:
+        for i, (_word, start_time, end_time) in enumerate(word_timings):
+            if start_time <= elapsed < end_time:
+                return min(i, total_words - 1)
+        sentence_end = max(end for _w, _s, end in word_timings)
+        if elapsed >= sentence_end:
+            return total_words - 1
+        return 0
+
+    # Which spoken word is being uttered right now?
+    tts_word_idx = None
+    tts_word_start = tts_word_end = None
+    for i, (_word, start_time, end_time) in enumerate(word_timings):
+        if start_time <= elapsed < end_time:
+            tts_word_idx, tts_word_start, tts_word_end = i, start_time, end_time
+            break
+
+    if tts_word_idx is None:
+        sentence_end = max(end for _w, _s, end in word_timings)
+        if elapsed >= sentence_end:
+            tts_word_idx = len(word_timings) - 1
+            _w, tts_word_start, tts_word_end = word_timings[tts_word_idx]
+
+    if tts_word_idx is None:
+        return 0
+
+    mapped_orig_words = [orig_idx for orig_idx, mapped in enumerate(word_mapping)
+                         if mapped == tts_word_idx]
+
+    if mapped_orig_words:
+        if len(mapped_orig_words) == 1:
+            return min(mapped_orig_words[0], total_words - 1)
+        # Several displayed tokens share one spoken word: split its duration
+        # between them.
+        tts_duration = tts_word_end - tts_word_start
+        if tts_duration <= 0:
+            return min(mapped_orig_words[0], total_words - 1)
+        time_per_orig_word = tts_duration / len(mapped_orig_words)
+        elapsed_in_tts_word = elapsed - tts_word_start
+        sub_word_idx = min(int(elapsed_in_tts_word / time_per_orig_word),
+                           len(mapped_orig_words) - 1)
+        return min(mapped_orig_words[max(sub_word_idx, 0)], total_words - 1)
+
+    # No displayed token owns this spoken word on its own:
+    # sanitize_text_for_tts() splits hyphen- and dash-joined tokens
+    # ("word-another", "past—it") into several spoken words, and only the
+    # first carries the token's mapping entry. Stay on that token — indexing
+    # the token list with the spoken word index landed the highlight ahead of
+    # the word actually being spoken.
+    return min(owner_word_index(word_mapping, tts_word_idx), total_words - 1)
+
+
+def mapping_for_displayed_words(
+    displayed_words: List[str],
+    timing_info: Dict[str, Any],
+) -> Optional[List[int]]:
+    """
+    Rebuild ``word_mapping`` for the sentence the reader is displaying.
+
+    ``timing_info`` is produced from the text the TTS engine actually spoke,
+    and ``content_parser.sanitize_text_for_tts`` rewrites that text before it
+    is spoken: hyphen- and dash-joined tokens become separate words
+    (``word-another`` -> ``word another``, ``past—it`` -> ``past it``,
+    ``10-20`` -> ``10 20``). Its ``word_mapping`` therefore indexes the
+    *spoken* token list, while ``reader.current_sentence_words`` and
+    ``reader.ui_word_idx`` index the displayed sentence's tokens. Using it
+    directly shifts the highlight by one position for every joined token
+    earlier in the sentence — measured on real eBooks, 53% of ticks were on
+    the wrong word for hyphenated sentences.
+
+    Args:
+        displayed_words: tokens of the sentence as rendered (the reader's
+            ``current_sentence_words``)
+        timing_info: timing dict returned by ``process_tts_timing_data``
+
+    Returns:
+        One timing index per displayed token, or ``None`` when no timings.
+    """
+    timings = timing_info.get("word_timings") or []
+    if not timings:
+        return None
+    # Aligning the displayed tokens against the timings themselves resolves
+    # both directions: tokens the engine split (several timings, one token)
+    # and tokens it merged (one timing, several tokens).
+    return create_word_mapping(displayed_words, timings) or timing_info.get("word_mapping")
+
+
 def create_word_mapping(original_words: List[str], tts_word_timings: List[Tuple[str, float, float]]) -> Optional[List[int]]:
     """
     Create a mapping from original word indices to TTS word timing indices.
@@ -99,6 +337,11 @@ def create_word_mapping(original_words: List[str], tts_word_timings: List[Tuple[
     - Case differences
     - Word combining/splitting by TTS engines
     - Punctuation-only tokens
+
+    Before falling back to that fuzzy matching, the two sides are aligned by
+    concatenation (``_align_sanitized``), which resolves the common case where
+    ``sanitize_text_for_tts`` split a hyphen- or dash-joined token into
+    several spoken words.
     
     Args:
         original_words: List of words from the original text
@@ -126,7 +369,14 @@ def create_word_mapping(original_words: List[str], tts_word_timings: List[Tuple[
         if orig_sanitized == tts_sanitized:
             logging.debug(f"create_word_mapping: Perfect 1:1 match with {len(original_words)} words")
             return list(range(len(original_words)))
-    
+
+    # Exact alignment first: recover split/merged tokens as a fact instead of
+    # guessing (see _align_sanitized).
+    aligned = _align_sanitized(orig_sanitized, tts_sanitized)
+    if aligned is not None:
+        logging.debug(f"create_word_mapping: Concatenation alignment of {len(aligned)} words")
+        return aligned
+
     # Create enhanced mapping algorithm with fuzzy matching
     mapping = []
     tts_index = 0
