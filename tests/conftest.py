@@ -51,6 +51,9 @@ def test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Prevent accidental real API calls to NanoGPT.
     monkeypatch.delenv("NANOGPT_API_KEY", raising=False)
 
+    # Prevent accidental real API calls to Speechify.
+    monkeypatch.delenv("SPEECHIFY_API_KEY", raising=False)
+
     # Disable parallel TTS by default in tests for deterministic behaviour.
     monkeypatch.setenv("LUE_TTS_PARALLEL_ENABLED", "False")
 
