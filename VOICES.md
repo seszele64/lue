@@ -708,3 +708,80 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+
+***
+
+### Speechify TTS (Simba `simba-3.2`)
+
+Speechify TTS talks to the Speechify Build API (`https://api.speechify.ai/v1/audio/speech`) to synthesize speech with the Simba model family. It requires a Speechify API key and an internet connection. Unlike the other cloud providers, Speechify returns **word-level speech marks with every response**, so the reader keeps word-level highlighting.
+
+#### Setup
+
+1. Set your API key: `export SPEECHIFY_API_KEY='your-key'`
+2. Install the dependency: `pip install lue[speechify]` (or `pip install httpx`)
+3. Use with: `lue book.epub --tts speechify`
+
+#### Available Voices
+
+| Voice | Notes |
+| :--- | :--- |
+| **wren** | Default voice |
+| george | Alternative voice |
+| henry | Alternative voice |
+| carly | Alternative voice |
+| sabrina | Alternative voice |
+
+Select a voice with `--voice`, e.g. `lue book.epub --tts speechify --voice george`. Call `GET /v1/voices` with your key to list every voice your workspace can use.
+
+#### Models
+
+| Model | Notes |
+| :--- | :--- |
+| **simba-3.2** | Default. Recommended English model, lowest TTFB and richest expressivity. Curated voice set only. |
+| simba-3.0 | Streaming multilingual (English + 6 European locales). Set `LUE_SPEECHIFY_TTS_MODEL` to override. |
+
+`simba-3.2` is English-only: a non-English voice returns HTTP 400. Use `simba-3.0` for other languages.
+
+#### Configuration
+
+| Environment variable | Default | Description |
+| :--- | :--- | :--- |
+| `SPEECHIFY_API_KEY` | *(required)* | Speechify API key |
+| `LUE_SPEECHIFY_TTS_MODEL` | `simba-3.2` | TTS model ID |
+| `SPEECHIFY_BASE_URL` | `https://api.speechify.ai` | API base URL |
+| `LUE_SPEECHIFY_TTS_MAX_CONCURRENT` | `1` | Max simultaneous requests (see limits below) |
+| `LUE_SPEECHIFY_TTS_TEXT_NORMALIZATION` | `False` | Expand numbers/abbreviations before synthesis |
+| `LUE_SPEECHIFY_TTS_TIMEOUT` | `30` | Per-request timeout (seconds) |
+| `LUE_SPEECHIFY_TTS_MAX_RETRIES` | `3` | Max retries for transient failures |
+| `LUE_SPEECHIFY_TTS_RETRY_BASE_DELAY` | `1.0` | Base backoff delay (seconds); `Retry-After` is honoured |
+
+#### Pricing
+
+Billed per character (whitespace and SSML tags are not counted):
+
+| Plan | Rate |
+| :--- | :--- |
+| Free | 500,000 characters free each month |
+| Starter | $10 per 1M characters |
+| Pro | $8 per 1M characters |
+| Scale | $6 per 1M characters |
+
+For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs approximately **$0.30** on Starter. Sentences already in the TTS cache are free.
+
+#### Limits
+
+| Plan | Requests/second | Simultaneous requests |
+| :--- | :--- | :--- |
+| Free | 1 (burst 10) | 1 |
+| Starter | 20 (burst 60) | 15 |
+| Pro | 40 (burst 120) | 30 |
+
+Lue serialises its own requests through a semaphore defaulting to **1**, so the free plan works without hitting `concurrency_limit_reached`. Raise `LUE_SPEECHIFY_TTS_MAX_CONCURRENT` if you are on a paid plan.
+
+#### Limitations
+
+- **Internet required**: Audio generation requires an active internet connection.
+- **2000 character limit**: Each request to `/v1/audio/speech` is limited to 2000 characters. Lue automatically chunks longer text at sentence boundaries, concatenates the audio, and offsets the word timings so highlighting stays aligned.
+- **English by default**: `simba-3.2` is English-only. Switch `LUE_SPEECHIFY_TTS_MODEL=simba-3.0` for German, Spanish, French, Italian or Brazilian Portuguese.
+- **Rate limits**: The free plan allows 1 request/second and 1 simultaneous request. Rate-limit (`429`) responses are retried with exponential backoff, honouring `Retry-After`.
+- **Usage costs**: Every uncached sentence is a billed API call. The TTS cache avoids re-generating already-heard sentences.

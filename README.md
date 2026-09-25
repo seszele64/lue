@@ -17,7 +17,7 @@ Lue is a versatile terminal eBook and document reader that is designed to seamle
 | **Feature**                             | **Description**                                                                                |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | **Multi-Format Support**             | Support for EPUB, PDF, TXT, DOCX, HTML, RTF, and Markdown with seamless format detection  |
-| **Modular TTS System**               | Edge TTS (default) and Kokoro TTS (local/offline) with extensible architecture for new models  |
+| **Modular TTS System**               | Edge TTS (default), Kokoro (local/offline), OpenAI and Speechify TTS with extensible architecture |
 | **Cross-Platform & Multilingual**    | Full support for macOS, Linux, Windows (via WSL) with 100+ languages and consistent global experience    |
 | **Speed Adjustment**                 | Adjust text-to-speech playback speed from 1x to 3x for personalized listening experience       |
 | **Auto-Scroll & Precise Word Highlighting**        | Automatic scrolling and word-level highlighting synchronized with actual speech, improving focus and concentration     |
@@ -158,7 +158,7 @@ lue --guide
 # View available command line options
 lue --help
 
-# Use specific TTS model (edge/kokoro/none) 
+# Use specific TTS model (edge/kokoro/openai/speechify/none) 
 lue --tts kokoro path/to/your/book.epub
 
 # Use a specific voice (full list at VOICES.md)

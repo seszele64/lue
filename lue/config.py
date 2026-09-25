@@ -12,6 +12,7 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",
     "kokoro": "af_heart",
     "openai": "alloy",
+    "speechify": "wren",
 }
 
 # Language codes for TTS models that require them
@@ -99,6 +100,37 @@ OPENAI_TTS_MAX_RETRIES = max(min(_tts_retries_raw, 10), 0) if _tts_retries_raw >
 # base * 2**(n-1) seconds before retrying.
 _tts_retry_delay_raw = float(os.environ.get("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "1.0"))
 OPENAI_TTS_RETRY_BASE_DELAY = max(_tts_retry_delay_raw, 0.1) if _tts_retry_delay_raw > 0 else 1.0
+
+# Speechify TTS settings (POST https://api.speechify.ai/v1/audio/speech)
+# The endpoint rejects input longer than 2000 characters per request
+# (HTTP 400 "Field input must not exceed 2000 characters"), so longer text
+# is chunked by the provider.
+SPEECHIFY_TTS_MAX_CHARS = 2000
+
+# Maximum simultaneous in-flight requests. The API enforces a per-plan
+# concurrency limit (1 request on the free plan); raising this above your
+# plan's limit produces HTTP 429 concurrency_limit_reached responses.
+_spc_raw = int(os.environ.get("LUE_SPEECHIFY_TTS_MAX_CONCURRENT", "1"))
+SPEECHIFY_TTS_MAX_CONCURRENT = max(min(_spc_raw, 8), 1) if _spc_raw >= 1 else 1
+
+# Whether to run Speechify's text normalization (expand numbers,
+# abbreviations) before synthesis.
+_spc_norm_raw = os.environ.get("LUE_SPEECHIFY_TTS_TEXT_NORMALIZATION", "False")
+SPEECHIFY_TTS_TEXT_NORMALIZATION = _spc_norm_raw.lower() in ("1", "true", "yes")
+
+# Per-request generation timeout (seconds).
+_spc_timeout_raw = float(os.environ.get("LUE_SPEECHIFY_TTS_TIMEOUT", "30"))
+SPEECHIFY_TTS_TIMEOUT = max(_spc_timeout_raw, 5.0) if _spc_timeout_raw > 0 else 30.0
+
+# Maximum retry attempts for transient failures (timeouts, connection
+# errors, server errors, rate/concurrency limits).
+_spc_retries_raw = int(os.environ.get("LUE_SPEECHIFY_TTS_MAX_RETRIES", "3"))
+SPEECHIFY_TTS_MAX_RETRIES = max(min(_spc_retries_raw, 10), 0) if _spc_retries_raw >= 0 else 3
+
+# Base delay in seconds for exponential backoff. Retry-After is honoured
+# when the server sends one and is longer than this schedule.
+_spc_delay_raw = float(os.environ.get("LUE_SPEECHIFY_TTS_RETRY_BASE_DELAY", "1.0"))
+SPEECHIFY_TTS_RETRY_BASE_DELAY = max(_spc_delay_raw, 0.1) if _spc_delay_raw > 0 else 1.0
 
 # TTS pipeline UI settings
 SHOW_BUFFER_STATUS = os.environ.get("LUE_SHOW_BUFFER_STATUS", "").lower() in ("1", "true", "yes")
