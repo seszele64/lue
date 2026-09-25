@@ -97,7 +97,8 @@ class Lue:
         """Initialize TTS-related state."""
         self.tts_model = tts_model
         self.tts_voice = tts_model.voice if tts_model and tts_model.voice else config.TTS_VOICES.get(tts_model.name) if tts_model else None
-        
+        self._saved_word_highlight_mode = None  # Stores previous mode before auto-disable
+
     def _load_content(self, quiet=False):
         """Load and process the document content."""
         if not quiet:
@@ -287,6 +288,23 @@ class Lue:
         initialized = await self.tts_model.initialize()
         if initialized:
             await self.tts_model.warm_up()
+
+            # Auto-adapt highlight mode based on provider capabilities
+            if hasattr(self.tts_model, "supports_word_timing"):
+                if not self.tts_model.supports_word_timing:
+                    # Provider does not support word timing — save current mode and disable
+                    if self._saved_word_highlight_mode is None:
+                        self._saved_word_highlight_mode = config.WORD_HIGHLIGHT_MODE
+                    config.WORD_HIGHLIGHT_MODE = 0
+                    self.console.print(
+                        "[yellow]Word-level timing not supported by this provider. Using sentence-level highlighting.[/yellow]"
+                    )
+                else:
+                    # Provider supports word timing — restore saved mode if exists
+                    if self._saved_word_highlight_mode is not None:
+                        config.WORD_HIGHLIGHT_MODE = self._saved_word_highlight_mode
+                        self._saved_word_highlight_mode = None  # Clear saved mode after restore
+
             return True
         else:
             self.console.print(f"[bold red]Initialization of {self.tts_model.name.upper()} failed. TTS will be disabled.[/bold red]")

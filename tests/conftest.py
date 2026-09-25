@@ -44,6 +44,13 @@ def test_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LUE_OPENAI_TTS_MAX_RETRIES", "0")
     monkeypatch.setenv("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "0.1")
 
+    monkeypatch.setenv("LUE_NANOGPT_TTS_TIMEOUT", "1")
+    monkeypatch.setenv("LUE_NANOGPT_TTS_MAX_RETRIES", "0")
+    monkeypatch.setenv("LUE_NANOGPT_TTS_RETRY_BASE_DELAY", "0.1")
+
+    # Prevent accidental real API calls to NanoGPT.
+    monkeypatch.delenv("NANOGPT_API_KEY", raising=False)
+
     # Disable parallel TTS by default in tests for deterministic behaviour.
     monkeypatch.setenv("LUE_TTS_PARALLEL_ENABLED", "False")
 
