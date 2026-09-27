@@ -48,7 +48,7 @@ MAX_QUEUE_SIZE = 12
 
 # Pre-buffering settings (controls when playback starts)
 # Playback begins once either threshold is reached
-PREBUFFER_MIN_ITEMS = 3       # Minimum sentences to pre-generate
+PREBUFFER_MIN_ITEMS = 4       # Minimum sentences to pre-generate
 PREBUFFER_MIN_SECONDS = 10.0  # Minimum seconds of audio to pre-generate
 
 # TTS cache settings
