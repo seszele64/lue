@@ -23,6 +23,22 @@ TTS_OVERLAP_SECONDS = {
     "kokoro": 0.6,
 }
 
+# OpenAI TTS retry settings
+# Per-request generation timeout (seconds). Requests that exceed this
+# are cancelled and retried if retries remain.
+_tts_timeout_raw = float(os.environ.get("LUE_OPENAI_TTS_TIMEOUT", "30"))
+OPENAI_TTS_TIMEOUT = max(_tts_timeout_raw, 5.0) if _tts_timeout_raw > 0 else 30.0
+
+# Maximum retry attempts for transient failures (timeouts, connection
+# errors, server errors, rate limits).
+_tts_retries_raw = int(os.environ.get("LUE_OPENAI_TTS_MAX_RETRIES", "3"))
+OPENAI_TTS_MAX_RETRIES = max(min(_tts_retries_raw, 10), 0) if _tts_retries_raw >= 0 else 3
+
+# Base delay in seconds for exponential backoff.  Attempt n waits
+# base * 2**(n-1) seconds before retrying.
+_tts_retry_delay_raw = float(os.environ.get("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "1.0"))
+OPENAI_TTS_RETRY_BASE_DELAY = max(_tts_retry_delay_raw, 0.1) if _tts_retry_delay_raw > 0 else 1.0
+
 # Audio processing settings
 AUDIO_DATA_DIR = user_cache_dir("lue")
 os.makedirs(AUDIO_DATA_DIR, exist_ok=True)
