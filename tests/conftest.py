@@ -1,15 +1,25 @@
 """
 Shared fixtures and configuration for the lue-reader test suite.
 
-All tests automatically inherit:
-  - Isolated environment variables (test_env) to prevent accidental API calls
-    and speed up test execution
-  - A temporary AUDIO_DATA_DIR to prevent side effects from config.py
+Isolation is applied at *import time* (module level), not via autouse
+fixtures, because ``lue.config`` runs ``os.makedirs()`` as a side effect of
+being imported.  A fixture only runs after collection has already imported
+the test modules, which is too late.  Concretely, this module:
+
+  - redirects ``platformdirs.user_cache_dir`` / ``user_data_dir`` into a
+    throwaway temp tree, so real user data is never touched, and
+  - pins environment variables (short timeouts, zero retries, small delays,
+    parallel TTS off, empty provider API keys) so a stray network call fails
+    fast instead of hanging or billing an account.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
+import platformdirs
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Generator
 from unittest.mock import Mock
@@ -18,63 +28,49 @@ import pytest
 from rich.console import Console
 
 
+# ── Import-time isolation (must run before lue.config is imported) ─────────
+
+_TEST_ROOT = tempfile.mkdtemp(prefix="lue-test-")
+
+# Bind the user- and cache-dir helpers to a temp tree *before* lue.config
+# computes AUDIO_DATA_DIR / PROGRESS_FILE_DIR at import time.
+platformdirs.user_cache_dir = lambda *args, **kwargs: os.path.join(_TEST_ROOT, "cache")
+platformdirs.user_data_dir = lambda *args, **kwargs: os.path.join(_TEST_ROOT, "data")
+
+# Low timeouts prevent hangs on network calls; zero retries make transient
+# failures surface immediately instead of delaying the suite; small delays
+# keep the retry-path tests fast.
+os.environ.update(
+    {
+        "LUE_OPENAI_TTS_TIMEOUT": "1",
+        "LUE_OPENAI_TTS_MAX_RETRIES": "0",
+        "LUE_OPENAI_TTS_RETRY_BASE_DELAY": "0.1",
+        # Deterministic, single-threaded TTS behaviour.
+        "LUE_TTS_PARALLEL_ENABLED": "False",
+        "LUE_LOOKAHEAD_SENTENCES": "5",
+        "LUE_TTS_MAX_CONCURRENT": "1",
+        # Suppress UI-related side effects.
+        "LUE_SHOW_BUFFER_STATUS": "false",
+        # Never let a test pick up a real provider credential.
+        "OPENAI_API_KEY": "",
+        "NANOGPT_API_KEY": "",
+        "SPEECHIFY_API_KEY": "",
+    }
+)
+
+
+@atexit.register
+def _cleanup_test_root() -> None:
+    """Remove the throwaway cache/data tree when the session ends."""
+    shutil.rmtree(_TEST_ROOT, ignore_errors=True)
+
+
 # ── pytest configuration ───────────────────────────────────────────────────
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register custom markers."""
     config.addinivalue_line("markers", "unit: Tests that verify individual functions/units in isolation")
     config.addinivalue_line("markers", "integration: Tests that verify interactions between multiple components")
-
-
-# ── Environment ────────────────────────────────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def test_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """
-    Set environment variables for a controlled test environment.
-
-    * Low timeouts prevent tests from hanging on network calls.
-    * Zero retries make transient failures surface immediately as errors
-      rather than delaying the test.
-    * Small delay values speed up retry-path tests when retries *are* used.
-    * Audio/cache paths are redirected to a throwaway temp directory so that
-      real user data is never touched.
-    """
-    monkeypatch.setenv("LUE_OPENAI_TTS_TIMEOUT", "1")
-    monkeypatch.setenv("LUE_OPENAI_TTS_MAX_RETRIES", "0")
-    monkeypatch.setenv("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "0.1")
-
-    # Disable parallel TTS by default in tests for deterministic behaviour.
-    monkeypatch.setenv("LUE_TTS_PARALLEL_ENABLED", "False")
-
-    # Small lookahead / concurrency to keep tests fast.
-    monkeypatch.setenv("LUE_LOOKAHEAD_SENTENCES", "5")
-    monkeypatch.setenv("LUE_TTS_MAX_CONCURRENT", "1")
-
-    # Suppress UI-related side effects.
-    monkeypatch.setenv("LUE_SHOW_BUFFER_STATUS", "false")
-
-
-@pytest.fixture(autouse=True)
-def temp_audio_dirs(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """
-    Redirect every directory that ``lue.config`` creates on import into an
-    empty per-test temporary directory.
-
-    Because ``config.py`` runs ``os.makedirs()`` at module level we must
-    patch before the first import.  This fixture (via ``conftest.py``
-    autouse) ensures that by the time any test module is collected the
-    patches are in place.
-    """
-    # Bind the user- and cache-dir helpers to a temp tree.
-    test_root = tmp_path / "lue_test_data"
-    test_root.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr("platformdirs.user_data_dir", lambda appname: str(test_root / "data"))
-    monkeypatch.setattr("platformdirs.user_cache_dir", lambda appname: str(test_root / "cache"))
 
 
 # ── Rich Console ───────────────────────────────────────────────────────────

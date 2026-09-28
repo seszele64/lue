@@ -2,10 +2,83 @@ import asyncio
 import os
 import random
 import logging
+from ssl import SSLError
+
 from rich.console import Console
 
 from .base import TTSBase
 from .. import config
+
+
+# ── Retry classification helpers ───────────────────────────────────────────
+
+#: Exception *class names* of transient transport failures.  Matching on the
+#: name (rather than only on the type) keeps the heuristic working for
+#: duck-typed stand-ins and for SDKs that cannot be imported at all.
+_RETRYABLE_TRANSPORT_NAMES = frozenset(
+    {
+        # timeouts
+        "TimeoutException",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        # connection / network
+        "ConnectError",
+        "NetworkError",
+        "ProxyError",
+        "ReadError",
+        "WriteError",
+        "CloseError",
+        # protocol
+        "RemoteProtocolError",
+        "ProtocolError",
+        "UnsupportedProtocol",
+    }
+)
+
+#: Non-5xx HTTP statuses that are still worth retrying: request timeout,
+#: version-conflict (optimistic concurrency) and rate limiting.
+_RETRYABLE_STATUSES = frozenset({408, 409, 429})
+
+
+def _status_of(exc: BaseException) -> int | None:
+    """Best-effort extraction of an HTTP status code from ``exc``.
+
+    Checks the SDK-style top-level ``status_code`` attribute first, then the
+    ``response.status_code`` pair used by ``httpx``.  Returns ``None`` when no
+    usable integer status can be found (missing, ``None``, or a mock/str
+    placeholder).
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+
+    return None
+
+
+def _status_is_retryable(status: int | None) -> bool | None:
+    """Tri-state verdict for an HTTP status code.
+
+    * ``True``  — 408, 409, 429 or any 5xx server error.
+    * ``False`` — any other 4xx client error (terminal: bad request, auth,
+      not found, ...).
+    * ``None``  — unknown / no error status, so no verdict can be given and
+      the caller should fall through to the next check.
+    """
+    if status is None:
+        return None
+    if status in _RETRYABLE_STATUSES:
+        return True
+    if 500 <= status < 600:
+        return True
+    if 400 <= status < 500:
+        return False
+    return None
 
 
 class OpenAITTS(TTSBase):
@@ -153,63 +226,102 @@ class OpenAITTS(TTSBase):
             await asyncio.sleep(wait_time)
 
     @staticmethod
-    def _should_retry(exc: Exception) -> bool:
-        """Return True if the exception should trigger a retry.
+    def _should_retry(exc: BaseException) -> bool:
+        """Return True if ``exc`` represents a transient failure worth retrying.
 
-        Retries on:
-        - asyncio.TimeoutError (our own per-request timeout)
-        - httpx.TimeoutException (connection-level timeout)
-        - httpx.ConnectError, httpx.RemoteProtocolError (network issues)
-        - HTTP 429 rate limit (from httpx.HTTPStatusError)
-        - HTTP 5xx server errors (from httpx.HTTPStatusError)
-        - SSLError, ConnectionResetError, BrokenPipeError (network issues)
+        The real OpenAI SDK does **not** raise the httpx exceptions the
+        original heuristic looked for: it wraps them in
+        ``openai.APIConnectionError`` / ``openai.APITimeoutError`` (network
+        problems) and ``openai.APIStatusError`` subclasses (HTTP errors), each
+        linked to the underlying httpx exception through ``__cause__``.  So we
+        walk the ``__cause__`` chain and classify at every level.
+
+        Ordered checks (the first one that yields a verdict wins):
+
+        1. ``asyncio.TimeoutError`` / builtin ``TimeoutError`` — our
+           per-request timeout plus any socket timeout surfaced as builtin.
+        2. ``openai.APIConnectionError`` — SDK connection failure (this also
+           covers ``openai.APITimeoutError``).
+        3. ``openai.APIStatusError`` — decided by the HTTP status policy.
+        4. ``httpx.HTTPStatusError`` — decided by the HTTP status policy.
+        5. ``httpx.TransportError`` — timeout/network/protocol/stream faults.
+        6. Name-based fallback for the same httpx families.  Kept
+           deliberately so duck-typed stand-ins still classify correctly even
+           when ``httpx``/``openai`` cannot be imported.
+        7. Builtin socket errors (``ConnectionError``, ``BrokenPipeError``,
+           ``SSLError``).
+        8. Any status code carried on the exception (``status_code`` or
+           ``response.status_code``), decided by the HTTP status policy.
+        9. Otherwise unwrap ``__cause__`` and repeat from step 1.
+
+        The HTTP status policy is ``_status_is_retryable``: 408, 409, 429 and
+        5xx retry; every other 4xx is terminal; anything else is inconclusive
+        and falls through to the next check.  A ``seen`` id-set makes
+        self-referential / cyclic ``__cause__`` chains terminate safely.
         """
-        exc_name = type(exc).__name__
-
-        # Our per-request timeout
-        if isinstance(exc, asyncio.TimeoutError):
-            return True
-
-        # httpx-specific network errors
-        if exc_name in (
-            "TimeoutException",
-            "ConnectError",
-            "ConnectTimeout",
-            "ReadTimeout",
-            "WriteTimeout",
-            "PoolTimeout",
-            "RemoteProtocolError",
-            "NetworkError",
-        ):
-            return True
-
-        # Transport-level errors
-        if isinstance(exc, (ConnectionError, BrokenPipeError)):
-            return True
-
-        # SSL errors
         try:
-            from ssl import SSLError
-            if isinstance(exc, SSLError):
+            from openai import (
+                APIConnectionError as _OAIConnectionError,
+                APIStatusError as _OAIStatusError,
+            )
+        except ImportError:  # openai is an optional dependency
+            _OAIConnectionError = _OAIStatusError = ()  # type: ignore[assignment]
+
+        try:
+            import httpx as _httpx
+        except ImportError:  # httpx is an optional dependency
+            _httpx = None  # type: ignore[assignment]
+
+        seen: set[int] = set()
+        current: BaseException | None = exc
+
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+
+            # (1) timeouts — ours, and any builtin socket timeout
+            if isinstance(current, (asyncio.TimeoutError, TimeoutError)):
                 return True
-        except ImportError:
-            pass
 
-        # HTTP status code errors (429 rate limit, 5xx server errors)
-        if hasattr(exc, "status_code"):
-            status = getattr(exc, "status_code", None)
-            if status is not None:
-                if status == 429 or (500 <= status < 600):
-                    return True
-                return False  # 4xx (except 429) are non-retryable
+            # (2) OpenAI SDK connection failure (incl. APITimeoutError)
+            if _OAIConnectionError and isinstance(current, _OAIConnectionError):
+                return True
 
-        # Check if it wraps an httpx.HTTPStatusError
-        if exc_name in ("HTTPStatusError",):
-            if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
-                status = exc.response.status_code
-                if status == 429 or (500 <= status < 600):
+            # (3) OpenAI SDK HTTP error — status policy
+            if _OAIStatusError and isinstance(current, _OAIStatusError):
+                verdict = _status_is_retryable(_status_of(current))
+                if verdict is not None:
+                    return verdict
+
+            if _httpx is not None:
+                # (4) httpx HTTP error — status policy
+                if isinstance(current, _httpx.HTTPStatusError):
+                    verdict = _status_is_retryable(_status_of(current))
+                    if verdict is not None:
+                        return verdict
+                # (5) httpx transport-level fault
+                elif isinstance(current, _httpx.TransportError):
                     return True
-            return False
+
+            # (6) name-based fallback for the same families
+            exc_name = type(current).__name__
+            if exc_name in _RETRYABLE_TRANSPORT_NAMES:
+                return True
+            if exc_name == "HTTPStatusError":
+                verdict = _status_is_retryable(_status_of(current))
+                if verdict is not None:
+                    return verdict
+
+            # (7) builtin socket errors
+            if isinstance(current, (ConnectionError, BrokenPipeError, SSLError)):
+                return True
+
+            # (8) any status code carried on the exception
+            verdict = _status_is_retryable(_status_of(current))
+            if verdict is not None:
+                return verdict
+
+            # (9) unwrap and keep walking the cause chain
+            current = getattr(current, "__cause__", None)
 
         return False
 
