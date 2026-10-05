@@ -12,6 +12,7 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",
     "kokoro": "af_heart",
     "openai": "alloy",
+    "nanogpt": "Rex",
 }
 
 # Language codes for TTS models that require them
@@ -99,6 +100,35 @@ elif _tts_max_raw > 8:
 TTS_MAX_CONCURRENT = _tts_max_raw
 
 TTS_MAX_CONCURRENT_FALLBACK = 1
+
+# NanoGPT TTS settings (xai-tts via https://nano-gpt.com/api/tts)
+# The route rejects input longer than 5000 characters per request
+# (error code TTS_INVALID_TEXT), so longer text is chunked by the provider.
+NANOGPT_TTS_MAX_CHARS = 5000
+
+# Synthesis speed multiplier (xai-tts accepts 0.7 - 1.5; default 1.0).
+try:
+    _ng_speed_raw = float(os.environ.get("LUE_NANOGPT_TTS_SPEED", "1"))
+except ValueError:
+    _ng_speed_raw = 1.0
+NANOGPT_TTS_SPEED = min(max(_ng_speed_raw, 0.7), 1.5)
+
+# Per-request generation timeout (seconds).
+_ng_timeout_raw = float(os.environ.get("LUE_NANOGPT_TTS_TIMEOUT", "30"))
+NANOGPT_TTS_TIMEOUT = max(_ng_timeout_raw, 5.0) if _ng_timeout_raw > 0 else 30.0
+
+# Maximum retry attempts for transient failures (timeouts, connection
+# errors, server errors, rate limits).
+_ng_retries_raw = int(os.environ.get("LUE_NANOGPT_TTS_MAX_RETRIES", "3"))
+NANOGPT_TTS_MAX_RETRIES = max(min(_ng_retries_raw, 10), 0) if _ng_retries_raw >= 0 else 3
+
+# Base delay in seconds for exponential backoff.
+_ng_retry_delay_raw = float(os.environ.get("LUE_NANOGPT_TTS_RETRY_BASE_DELAY", "1.0"))
+NANOGPT_TTS_RETRY_BASE_DELAY = max(_ng_retry_delay_raw, 0.1) if _ng_retry_delay_raw > 0 else 1.0
+
+# Async (HTTP 202) job polling for models that do not respond synchronously.
+NANOGPT_TTS_POLL_INTERVAL = float(os.environ.get("LUE_NANOGPT_TTS_POLL_INTERVAL", "3"))
+NANOGPT_TTS_POLL_MAX_ATTEMPTS = int(os.environ.get("LUE_NANOGPT_TTS_POLL_MAX_ATTEMPTS", "60"))
 
 # TTS pipeline UI settings
 SHOW_BUFFER_STATUS = os.environ.get("LUE_SHOW_BUFFER_STATUS", "").lower() in ("1", "true", "yes")

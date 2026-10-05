@@ -708,3 +708,57 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+
+***
+
+### NanoGPT TTS (SpaceXAI `xai-tts`)
+
+NanoGPT TTS uses the NanoGPT gateway (`https://nano-gpt.com/api/tts`) to reach the Runware-hosted SpaceXAI text-to-speech model. It requires a NanoGPT API key and an internet connection. The provider does not expose word-level timing metadata, so the reader falls back to sentence-level highlighting.
+
+#### Setup
+
+1. Set your API key: `export NANOGPT_API_KEY='your-key'`
+2. Install the dependency: `pip install lue[nanogpt]` (or `pip install httpx`)
+3. Use with: `lue book.epub --tts nanogpt`
+
+#### Available Voices
+
+| Voice | Notes |
+| :--- | :--- |
+| **Rex** | Default voice |
+| Eve | Alternative voice |
+| Ara | Alternative voice |
+| Leo | Alternative voice |
+| Sal | Alternative voice |
+
+Select a voice with `--voice`, e.g. `lue book.epub --tts nanogpt --voice Eve`.
+
+#### Models
+
+| Model | Notes |
+| :--- | :--- |
+| xai-tts | SpaceXAI TTS (default). Multilingual auto-detection, inline expressive controls. Set `NANOGPT_TTS_MODEL` to override. |
+
+#### Configuration
+
+| Environment variable | Default | Description |
+| :--- | :--- | :--- |
+| `NANOGPT_API_KEY` | *(required)* | NanoGPT API key |
+| `NANOGPT_TTS_MODEL` | `xai-tts` | TTS model ID |
+| `NANOGPT_BASE_URL` | `https://nano-gpt.com/api` | API base URL |
+| `LUE_NANOGPT_TTS_SPEED` | `1` | Synthesis speed (clamped to 0.7–1.5) |
+| `LUE_NANOGPT_TTS_TIMEOUT` | `30` | Per-request timeout (seconds) |
+| `LUE_NANOGPT_TTS_MAX_RETRIES` | `3` | Max retries for transient failures |
+
+#### Pricing
+
+- **xai-tts**: $0.0165 per 1000 characters ($16.50 per 1 million characters)
+
+For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs approximately $0.495.
+
+#### Limitations
+
+- **No word-level timing**: The reader automatically switches to sentence-level highlighting.
+- **Internet required**: Audio generation requires an active internet connection.
+- **5000 character limit**: Each request is limited to 5000 characters. Lue automatically chunks longer text at sentence boundaries and concatenates the audio, so this is handled transparently.
+- **Usage costs**: Every uncached sentence is a billed API call. The TTS cache avoids re-generating already-heard sentences.
