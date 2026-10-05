@@ -16,3 +16,5 @@ edge-tts>=7.2.7
 # kokoro>=0.9.4
 # soundfile>=0.13.1
 # huggingface-hub>=0.34.4
+## For OpenAI TTS (requires OPENAI_API_KEY):
+# openai>=1.0.0
