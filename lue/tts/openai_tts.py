@@ -113,7 +113,7 @@ class OpenAITTS(TTSBase):
                 "[bold red]Error: 'openai' package not found.[/bold red]"
             )
             self.console.print(
-                "[yellow]Please run 'pip install openai' to use this TTS model.[/yellow]"
+                "[yellow]Please run 'pip install lue-reader\\[openai]' to use this TTS model.[/yellow]"
             )
             logging.error("'openai' is not installed.")
             return False
