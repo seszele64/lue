@@ -1,6 +1,6 @@
 # Lue - Voices and Languages Guide
 
-This document explains the speakers and languages included in the Edge, Kokoro, and OpenAI TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key.
+This document explains the speakers and languages included in the Edge, Kokoro, OpenAI, and CapCut TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key; CapCut TTS is an optional, unofficial integration that also needs no key.
 
 ***
 
@@ -14,6 +14,7 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
     "openai": "alloy",            # Default OpenAI voice
+    "capcut": "BV074_streaming",  # Default CapCut streaming voice
 }
 
 # Language settings for TTS models
@@ -708,3 +709,46 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+***
+
+### CapCut TTS
+
+`CapCut TTS` wraps the **[K07VN/capcut-tts-api](https://github.com/K07VN/capcut-tts-api)** SDK, which drives CapCut's online text-to-speech service. It needs **no API key**, only an internet connection and a CapCut account's free credit allowance.
+
+> **⚠️ Unofficial, use at your own risk.** This integration reverse-engineers CapCut's private web API. It spoofs a desktop device/signature to authenticate, which likely violates CapCut's Terms of Service and may lead to account restrictions. It may break at any time if CapCut changes its API. You are responsible for how you use it, including any credits consumed and compliance with CapCut's terms. Do not hammer the service — respect its rate limits.
+
+#### Setup
+
+1. Install the extra (the SDK is a git dependency, not on PyPI):
+   `pip install 'lue-reader[capcut]'`
+2. Use it: `lue book.epub --tts capcut`
+
+The provider produces MP3 audio and does **not** expose word-level timing, so Lue uses sentence-level highlighting for it.
+
+#### Voices
+
+CapCut voices are numeric resource IDs exposed by the SDK's catalogue (`data/Voice.json`). Set a voice with `--voice <id>` or change `TTS_VOICES["capcut"]` in `lue/config.py`. When the catalogue is unavailable, Lue falls back to the SDK's built-in streaming voice:
+
+| Voice | Notes |
+| :--- | :--- |
+| **BV074_streaming** | Default. Built-in streaming voice; works even when `Voice.json` cannot be loaded. |
+| *other IDs* | Populated by the SDK's `list_voices()`; exact values depend on the installed SDK revision. |
+
+#### Environment variables
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `LUE_CAPCUT_TTS_TIMEOUT` | `120` | Per-request wall-clock timeout in seconds (30s floor). Covers submit + poll + download. |
+| `LUE_CAPCUT_TTS_MAX_RETRIES` | `2` | Retry attempts for transient failures (0-10). |
+| `LUE_CAPCUT_TTS_RETRY_BASE_DELAY` | `2.0` | Base delay in seconds for exponential backoff (0.5s floor). |
+| `LUE_CAPCUT_TTS_RATE` | `1.0` | Speaking rate, clamped to the accepted range **0.5-2.0**. |
+| `LUE_CAPCUT_RESOURCE_ID` | *unset* | Optional resource/voice-catalogue override forwarded to `create_tts_task`. |
+| `LUE_CAPCUT_TTS_WARMUP` | `false` | Set to `true`/`1` to synthesize a throwaway sentence on startup. |
+
+#### Limitations
+
+- **No word-level timing**: sentence-level highlighting is used.
+- **Unofficial API**: reverse-engineered and subject to change without notice; not affiliated with CapCut/ByteDance.
+- **Device spoofing & ToS**: the SDK impersonates the CapCut desktop client; use may breach CapCut's terms and consume account credits.
+- **Rate limits / credits**: CapCut may throttle requests or exhaust free credits; avoid large batches in quick succession.
+- **Git-only dependency**: installs from GitHub, so it requires network access at install time; pinning to a commit is recommended for reproducibility.

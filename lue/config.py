@@ -11,6 +11,9 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",
     "kokoro": "af_heart",
     "openai": "alloy",
+    # CapCut's built-in streaming voice. Matches the SDK's fallback resource
+    # (7102355709945188865), so it works even when Voice.json is unavailable.
+    "capcut": "BV074_streaming",
 }
 
 # Language codes for TTS models that require them
@@ -38,6 +41,50 @@ OPENAI_TTS_MAX_RETRIES = max(min(_tts_retries_raw, 10), 0) if _tts_retries_raw >
 # base * 2**(n-1) seconds before retrying.
 _tts_retry_delay_raw = float(os.environ.get("LUE_OPENAI_TTS_RETRY_BASE_DELAY", "1.0"))
 OPENAI_TTS_RETRY_BASE_DELAY = max(_tts_retry_delay_raw, 0.1) if _tts_retry_delay_raw > 0 else 1.0
+
+# ── CapCut TTS (K07VN/capcut-tts-api) ──────────────────────────────────────
+
+# Per-request wall-clock timeout (seconds). The task creation + polling +
+# download must finish within this window, otherwise the request is retried
+# if retries remain. Defaults to 2 minutes, with a 30 second floor.
+_capcut_timeout_raw = float(os.environ.get("LUE_CAPCUT_TTS_TIMEOUT", "120"))
+CAPCUT_TTS_TIMEOUT = max(_capcut_timeout_raw, 30.0) if _capcut_timeout_raw > 0 else 120.0
+
+# Maximum retry attempts for transient failures (network errors, task
+# failures, rate limits).
+_capcut_retries_raw = int(os.environ.get("LUE_CAPCUT_TTS_MAX_RETRIES", "2"))
+CAPCUT_TTS_MAX_RETRIES = max(min(_capcut_retries_raw, 10), 0) if _capcut_retries_raw >= 0 else 2
+
+# Base delay in seconds for exponential backoff. Attempt n waits
+# base * 2**(n-1) seconds before retrying.
+_capcut_retry_delay_raw = float(os.environ.get("LUE_CAPCUT_TTS_RETRY_BASE_DELAY", "2.0"))
+CAPCUT_TTS_RETRY_BASE_DELAY = max(_capcut_retry_delay_raw, 0.5) if _capcut_retry_delay_raw > 0 else 2.0
+
+# Speaking rate passed through to CapCut as a string (e.g. "1.0", "1.2").
+# Parsed as a float and clamped to the range CapCut accepts (0.5-2.0); an
+# unparseable value falls back to 1.0 rather than crashing at import time.
+try:
+    _capcut_rate_raw = float(os.environ.get("LUE_CAPCUT_TTS_RATE", "1.0"))
+except (TypeError, ValueError):
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "Invalid LUE_CAPCUT_TTS_RATE=%r; falling back to 1.0.",
+        os.environ.get("LUE_CAPCUT_TTS_RATE"),
+    )
+    _capcut_rate_raw = 1.0
+CAPCUT_TTS_RATE = str(min(max(_capcut_rate_raw, 0.5), 2.0))
+
+# Optional CapCut resource id override. ``None`` lets the SDK use its default.
+CAPCUT_RESOURCE_ID = os.environ.get("LUE_CAPCUT_RESOURCE_ID") or None
+
+# Whether to synthesize a throwaway sentence on warm-up to prime the session.
+CAPCUT_TTS_WARMUP = os.environ.get("LUE_CAPCUT_TTS_WARMUP", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Audio processing settings
 AUDIO_DATA_DIR = user_cache_dir("lue")

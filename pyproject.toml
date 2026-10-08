@@ -43,6 +43,15 @@ kokoro = [
 openai = [
     "openai>=1.0.0",
 ]
+capcut = [
+    # TODO(security): pin to an immutable commit SHA for supply-chain safety
+    # (upstream publishes no tags, so `main` is a moving target), e.g.
+    #   "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@<sha>"
+    # Resolve the current SHA with (network required, done manually/CI):
+    #   git ls-remote https://github.com/K07VN/capcut-tts-api main
+    "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api",
+    "requests>=2.25.0",
+]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.25.0",
