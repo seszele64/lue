@@ -1,8 +1,8 @@
 import sys
-import subprocess
 import json
 import os
 import re
+import signal
 import time
 
 # Default keyboard shortcuts
@@ -294,14 +294,27 @@ def process_input(reader):
 
 
 def _kill_audio_immediately(reader):
-    """Kill audio playback immediately."""
-    for process in reader.playback_processes[:]:
+    """Kill audio playback immediately (thread-safe; spec-v3 §9.2, G3).
+
+    Runs on the raw-key input thread, so it may only touch plain state: it
+    bumps the generation token (a plain int assign, atomic under the GIL) and
+    SIGKILLs the sink by PID.  It must not close the StreamWriter or reap the
+    process — the follow-up navigation command runs the full 10-step teardown
+    on the event loop under ``audio_restart_lock``, which owns fd close and
+    reaping.  The token bump makes ``writer_task`` abort at its next generation
+    check, so no further bytes are written in the meantime.
+    """
+    reader.audio_generation += 1
+    sink = getattr(reader, 'sink', None)
+    pid = getattr(sink, 'pid', None) if sink is not None else None
+    if pid:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError, AttributeError):
+            pass
+    # Legacy path: the tracked per-file ffplay processes are plain state too.
+    for process in list(getattr(reader, 'playback_processes', []) or []):
         try:
             process.kill()
         except (ProcessLookupError, AttributeError):
             pass
-    try:
-        subprocess.run(['pkill', '-f', 'ffplay'], check=False, 
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pass

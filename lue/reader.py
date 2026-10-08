@@ -9,7 +9,7 @@ from rich.console import Console
 from rich.text import Text
 import platformdirs
 
-from . import config, content_parser, progress_manager, audio, ui, input_handler
+from . import config, content_parser, progress_manager, audio, ui, input_handler, audio_sink
 from .tts.base import TTSBase
 
 class Lue:
@@ -35,15 +35,32 @@ class Lue:
         self.playback_processes = []
         self.producer_task = None
         self.player_task = None
+        self.writer_task = None
+        self.decoder_tasks = []
         self.ui_update_task = None
         self.command_received_event = asyncio.Event()
         self.playback_finished_event = asyncio.Event()
-        self.audio_queue = asyncio.Queue(maxsize=config.MAX_QUEUE_SIZE)
+
+        # Playback facade owns the generation token and the two queues.  The
+        # reader exposes ``audio_generation`` / ``audio_queue`` / ``decode_queue``
+        # as delegating properties (spec-v3 §10).
+        self.playback = audio.AudioPlaybackController()
         self.active_playback_tasks = []
         self.audio_restart_lock = asyncio.Lock()
         self.pending_restart_task = None
         self.playback_speed = 1.0  # Default speed multiplier
-        
+
+        # Persistent sink state (spec-v3 §10).  ``sink_clock`` is rebuilt per
+        # generation by ``play_from_current_position``; this initial empty table
+        # satisfies callers that touch it before the first start.
+        self.sink = None
+        self.sink_clock = None
+        self.segment_table = audio_sink.SegmentTable()
+        self._current_decoder = None
+        self._session_dir = None
+        self._sink_eof_intended = False
+        self._resume = None
+
         # Add pause toggle lock and task tracking
         self.pause_toggle_lock = asyncio.Lock()
         self.current_pause_toggle_task = None
@@ -61,6 +78,24 @@ class Lue:
         self.chapter_index_panel_y = 0
         self.chapter_index_panel_width = 0
         self.chapter_index_panel_height = 0
+
+    # ── Playback facade delegates (spec-v3 §10) ─────────────────────────────
+
+    @property
+    def audio_generation(self):
+        return self.playback.generation
+
+    @audio_generation.setter
+    def audio_generation(self, value):
+        self.playback.generation = value
+
+    @property
+    def audio_queue(self):
+        return self.playback.audio_queue
+
+    @property
+    def decode_queue(self):
+        return self.playback.decode_queue
 
     def _initialize_tts(self, tts_model):
         """Initialize TTS-related state."""
@@ -199,7 +234,7 @@ class Lue:
         if self.speed_reading_enabled:
             config.UI_MODE = 3
         self.is_paused = not progress_data["tts_enabled"]
-        self.playback_speed = progress_data["playback_speed"]
+        self.playback_speed = self._clamp_speed(progress_data["playback_speed"])
         if not self.tts_model:
             self.is_paused = True
             
@@ -686,36 +721,57 @@ class Lue:
             return success
         return False
 
-    def _increase_speed(self):
-        """Increase playback speed."""
-        speed_levels = [round(i * 0.1, 1) for i in range(10, 31)]  # 1.0 to 3.0 in 0.1 increments
-        current_index = 0
-        for i, speed in enumerate(speed_levels):
-            if abs(speed - self.playback_speed) < 0.01:
-                current_index = i
-                break
+    @staticmethod
+    def _speed_levels():
+        """Return the shared speed grid ``SPEED_MIN..SPEED_MAX`` step ``SPEED_STEP``."""
+        levels = []
+        n = int(round((config.SPEED_MAX - config.SPEED_MIN) / config.SPEED_STEP))
+        for k in range(n + 1):
+            levels.append(round(config.SPEED_MIN + k * config.SPEED_STEP, 1))
+        return levels
 
-        if current_index < len(speed_levels) - 1:
-            self.playback_speed = speed_levels[current_index + 1]
-            self._save_extended_progress()
-            return True
-        return False
+    @classmethod
+    def _clamp_speed(cls, value):
+        """Clamp an arbitrary speed onto the valid range (off-grid values allowed)."""
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return config.DEFAULT_SPEED
+        return max(config.SPEED_MIN, min(config.SPEED_MAX, value))
+
+    def _nearest_speed_index(self, levels):
+        """Snap ``playback_speed`` to the nearest grid index (never default to 0)."""
+        target = self._clamp_speed(self.playback_speed)
+        best_idx, best_dist = 0, None
+        for i, level in enumerate(levels):
+            dist = abs(level - target)
+            if best_dist is None or dist < best_dist:
+                best_idx, best_dist = i, dist
+        return best_idx
+
+    def _increase_speed(self):
+        """Increase playback speed along the shared grid (§6.3)."""
+        levels = self._speed_levels()
+        current_index = self._nearest_speed_index(levels)
+        new_speed = min(levels[current_index + 1] if current_index < len(levels) - 1 else levels[current_index], config.SPEED_MAX)
+        new_speed = self._clamp_speed(new_speed)
+        if abs(new_speed - self.playback_speed) < 1e-9:
+            return False
+        self.playback_speed = new_speed
+        self._save_extended_progress()
+        return True
 
     def _decrease_speed(self):
-        """Decrease playback speed (limited to not go below 1.0x)."""
-        speed_levels = [round(i * 0.1, 1) for i in range(10, 31)]  # 1.0 to 3.0 in 0.1 increments
-        current_index = 0
-        for i, speed in enumerate(speed_levels):
-            if abs(speed - self.playback_speed) < 0.01:
-                current_index = i
-                break
-
-        # Only allow decreasing speed if we're above 1.0x
-        if current_index > 0:
-            self.playback_speed = speed_levels[current_index - 1]
-            self._save_extended_progress()
-            return True
-        return False
+        """Decrease playback speed along the shared grid (§6.3)."""
+        levels = self._speed_levels()
+        current_index = self._nearest_speed_index(levels)
+        new_speed = max(levels[current_index - 1] if current_index > 0 else levels[current_index], config.SPEED_MIN)
+        new_speed = self._clamp_speed(new_speed)
+        if abs(new_speed - self.playback_speed) < 1e-9:
+            return False
+        self.playback_speed = new_speed
+        self._save_extended_progress()
+        return True
 
     def _get_speed_display(self):
         """Get the speed display string for UI using superscript characters with middle dot and fixed decimal places."""
@@ -955,19 +1011,22 @@ class Lue:
     async def _restart_audio_after_navigation(self):
         """Restart audio after navigation, preventing concurrent executions."""
         async with self.audio_restart_lock:
-            # Cancel any pending restart task
-            if self.pending_restart_task and not self.pending_restart_task.done():
-                self.pending_restart_task.cancel()
+            # Cancel any pending restart task (unless it is *this* task — e.g. the
+            # supervisor scheduled us into pending_restart_task).
+            current = asyncio.current_task()
+            pending = self.pending_restart_task
+            if pending and not pending.done() and pending is not current:
+                pending.cancel()
                 try:
-                    await self.pending_restart_task
+                    await pending
                 except asyncio.CancelledError:
                     pass
-            
+
             await audio.stop_and_clear_audio(self)
-            
+
             # Add a small delay to debounce rapid navigation
             await asyncio.sleep(0.1)
-            
+
             # Check if we're still running and not paused after the delay
             if not self.is_paused and self.running:
                 await audio.play_from_current_position(self)
@@ -1070,23 +1129,58 @@ class Lue:
                 self.smooth_scroll_task.cancel()
         self._save_extended_progress()
 
+    def _snapshot_resume_position(self):
+        """Snapshot the audible position for a pause/resume (§9.3).
+
+        Returns a ``(pos, resume_src)`` tuple (or ``None`` to resume at the
+        current sentence start).  Only applies to the persistent-sink path.
+        """
+        clock = self.sink_clock
+        table = self.segment_table
+        if clock is None or table is None:
+            return None
+        try:
+            now = asyncio.get_event_loop().time()
+            p_p = clock.position(now)
+            seg = table.find(p_p)
+        except Exception:  # noqa: BLE001
+            return None
+        if seg is None or seg.is_silence or seg.pos is None:
+            return None
+        local_out = max(0.0, p_p - seg.out_start)
+        resume_src = seg.src_offset + local_out * seg.speed
+        if seg.src_duration and resume_src >= seg.src_duration - 0.05:
+            return None
+        if resume_src <= 0.0:
+            return None
+        return (seg.pos, resume_src)
+
     async def _handle_pause_toggle(self):
         """Handle pause/resume toggle with proper locking to prevent concurrent audio playback."""
         async with self.pause_toggle_lock:
-            # Cancel any existing pause toggle task
-            if self.current_pause_toggle_task and not self.current_pause_toggle_task.done():
-                self.current_pause_toggle_task.cancel()
-                try:
-                    await self.current_pause_toggle_task
-                except asyncio.CancelledError:
-                    pass
-            
-            # Stop current audio playback
-            await audio.stop_and_clear_audio(self)
-            
-            # Only start playback if we're not paused and still running
-            if not self.is_paused and self.running and self.tts_model:
-                await audio.play_from_current_position(self)
+            async with self.audio_restart_lock:
+                # Cancel any existing pause toggle task (unless it is this task).
+                current = asyncio.current_task()
+                pending = self.current_pause_toggle_task
+                if pending and not pending.done() and pending is not current:
+                    pending.cancel()
+                    try:
+                        await pending
+                    except asyncio.CancelledError:
+                        pass
+
+                # When pausing, snapshot the audible position so resume is exact.
+                if self.is_paused:
+                    self._resume = self._snapshot_resume_position()
+                else:
+                    self._resume = None
+
+                # Stop current audio playback
+                await audio.stop_and_clear_audio(self)
+
+                # Only start playback if we're not paused and still running
+                if not self.is_paused and self.running and self.tts_model:
+                    await audio.play_from_current_position(self)
 
     def _handle_resize(self, signum, frame):
         if not self.resize_scheduled:
@@ -1137,15 +1231,132 @@ class Lue:
                 await asyncio.sleep(self.ui_update_interval)
 
     async def _word_update_loop(self):
-        """Update word index during playback based on elapsed time."""
+        """Update the highlight from the authoritative audio clock (20 Hz).
+
+        On the persistent-sink path the visible sentence advances at the
+        segment's *audible* onset (``P(t) >= seg.out_start``), computed from
+        :class:`~lue.audio_sink.SinkClock` + :class:`~lue.audio_sink.SegmentTable`
+        (spec-v3 §4.3/§4.4).  The legacy wall-clock anchor is kept for the
+        ``--legacy-audio`` path.
+        """
         while self.running:
             try:
-                if (not self.is_paused and
-                    hasattr(self, 'current_sentence_words') and
-                    hasattr(self, 'current_sentence_duration') and
-                    hasattr(self, 'current_word_start_time') and
-                    self.current_sentence_words and
-                    self.current_sentence_duration > 0):
+                if not self.is_paused:
+                    if self.sink_clock is not None and config.USE_PERSISTENT_SINK:
+                        self._update_highlight_from_sink()
+                    else:
+                        self._update_highlight_legacy()
+                await asyncio.sleep(0.05)  # Update at 20Hz
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.05)
+
+    def _load_segment_words(self, seg):
+        """Populate ``current_sentence_words`` from the segment's source sentence."""
+        try:
+            c, p, s = seg.pos
+            sentences = content_parser.split_into_sentences(self.chapters[c][p])
+            text = sentences[s]
+        except (TypeError, IndexError, AttributeError):
+            self.current_sentence_words = []
+            return
+        # Mirror the producer's abbreviation-fragment merge so the word count
+        # matches the merged audio the segment was decoded from.
+        try:
+            if (re.fullmatch(audio.ABBREVIATION_PATTERN, text.strip())
+                    and s + 1 < len(sentences)):
+                text = text + " " + sentences[s + 1]
+        except re.error:
+            pass
+        self.current_sentence_words = [
+            token for token in text.split() if re.search(r'[a-zA-Z0-9]', token)
+        ]
+
+    def _word_index_for_segment(self, seg, local_src, local_out):
+        """Compute the source-domain word index for ``local_src`` (spec-v3 §4.4).
+
+        Mirrors the legacy algorithm but works in source/TTS seconds, mapped
+        back from the output clock via ``local_src``.
+        """
+        total_words = len(self.current_sentence_words)
+        if total_words == 0:
+            return None
+
+        timings = seg.word_timings
+        if timings:
+            tts_idx = None
+            for i, (_w, start, end) in enumerate(timings):
+                if start <= local_src < end:
+                    tts_idx = i
+                    break
+            if tts_idx is None:
+                max_end = max((end for _w, _s, end in timings), default=0.0)
+                tts_idx = len(timings) - 1 if local_src >= max_end else 0
+
+            mapping = seg.word_mapping
+            if mapping:
+                mapped = [oi for oi, ti in enumerate(mapping) if ti == tts_idx]
+                if mapped:
+                    if len(mapped) == 1:
+                        return min(mapped[0], total_words - 1)
+                    start = timings[tts_idx][1]
+                    end = timings[tts_idx][2]
+                    span = end - start
+                    if span > 0:
+                        per = span / len(mapped)
+                        sub = min(int((local_src - start) / per), len(mapped) - 1)
+                        return min(mapped[sub], total_words - 1)
+                    return min(mapped[-1], total_words - 1)
+            return min(tts_idx, total_words - 1)
+
+        # No word timings: equal split over the source (or output) duration.
+        use_src = bool(seg.src_duration and seg.src_duration > 0)
+        span = seg.src_duration if use_src else seg.out_duration
+        if span and span > 0:
+            per = span / total_words
+            if per > 0:
+                bar = local_src if use_src else local_out
+                return min(int(bar / per), total_words - 1)
+        return 0
+
+    def _update_highlight_from_sink(self):
+        """Advance the visible sentence/word from the sink clock (spec-v3 §4.4)."""
+        clock = self.sink_clock
+        table = self.segment_table
+        if clock is None or table is None:
+            return
+        # While a navigation/speed restart is pending, that path owns the
+        # position; don't fight it with the (about to be torn down) clock.
+        pending = self.pending_restart_task
+        if pending is not None and not pending.done():
+            return
+        now = asyncio.get_event_loop().time()
+        p_pos = clock.position(now)
+        seg = table.find(p_pos)
+        if seg is None or seg.generation != self.audio_generation:
+            return
+        if seg.is_silence or seg.pos is None:
+            return
+        if getattr(self, '_sink_seg', None) is not seg:
+            self.chapter_idx, self.paragraph_idx, self.sentence_idx = seg.pos
+            self.ui_word_idx = 0
+            self._load_segment_words(seg)
+            self._sink_seg = seg
+        local_out = max(0.0, p_pos - seg.out_start)
+        speed = seg.speed or 1.0
+        local_src = seg.src_offset + local_out * speed
+        idx = self._word_index_for_segment(seg, local_src, local_out)
+        if idx is not None and idx != self.ui_word_idx:
+            self.ui_word_idx = idx
+
+    def _update_highlight_legacy(self):
+        """Legacy wall-clock highlight (``--legacy-audio`` path only)."""
+        if (hasattr(self, 'current_sentence_words') and
+            hasattr(self, 'current_sentence_duration') and
+            hasattr(self, 'current_word_start_time') and
+            self.current_sentence_words and
+            self.current_sentence_duration > 0):
 
                     elapsed = asyncio.get_event_loop().time() - self.current_word_start_time
                     # Account for playback speed
@@ -1226,20 +1437,19 @@ class Lue:
                         if current_word_idx != self.ui_word_idx:
                             self.ui_word_idx = current_word_idx
 
-                await asyncio.sleep(0.05)  # Update at 20Hz
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(0.05)
-
     async def _shutdown(self):
         self.running = False
         signal.signal(signal.SIGWINCH, signal.SIG_DFL)
         signal.signal(signal.SIGINT, signal.SIG_DFL)
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         
-        # Cancel all tasks including pending restart task and pause toggle task
-        tasks_to_cancel = [self.smooth_scroll_task, self.ui_update_task, self.word_update_task, self.pending_restart_task, self.current_pause_toggle_task]
+        # Cancel all tasks including the sink pipeline, pending restart and
+        # pause toggle tasks (spec-v3 §5.4).  ``stop_and_clear_audio`` then
+        # performs the full 10-step teardown (writer/sink/decoders + session dir).
+        tasks_to_cancel = [
+            self.smooth_scroll_task, self.ui_update_task, self.word_update_task,
+            self.pending_restart_task, self.current_pause_toggle_task,
+        ]
         for task in tasks_to_cancel:
             if task and not task.done():
                 task.cancel()
@@ -1303,6 +1513,14 @@ class Lue:
         signal.signal(signal.SIGTERM, self._handle_exit_signal)
         
         if not self.chapters or not self.chapters[0]: return
+
+        # Best-effort cleanup of stale per-generation temp dirs (§9.4).
+        try:
+            audio_sink.sweep_stale_sessions()
+        except Exception:  # noqa: BLE001
+            pass
+        path = "persistent-sink" if config.USE_PERSISTENT_SINK else "legacy-per-file"
+        logging.info("Audio pipeline active: %s", path)
             
         self.ui_update_task = asyncio.create_task(self._ui_update_loop())
         self.word_update_task = asyncio.create_task(self._word_update_loop())
@@ -1490,8 +1708,18 @@ class Lue:
             if cmd == 'quit': break
 
             if cmd == 'finish':
+                # The event means *bytes played* (spec-v3 §5.5): the supervisor
+                # sets it only after the sink exits.  Bound the wait so a wedged
+                # sink can never hang the UI (the writer already enforces
+                # SINK_EOF_TIMEOUT_S and kills a stalled sink).
                 if self.player_task and not self.player_task.done():
-                    await self.playback_finished_event.wait()
+                    try:
+                        await asyncio.wait_for(
+                            self.playback_finished_event.wait(),
+                            timeout=config.SINK_EOF_TIMEOUT_S + 2.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logging.warning("Timed out waiting for the audio sink to finish")
                 await self.audio_queue.join()
                 break
 

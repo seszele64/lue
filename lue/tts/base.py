@@ -1,7 +1,30 @@
 """Abstract base class for TTS models in the Lue eBook reader."""
 
 from abc import ABC, abstractmethod
+import logging
+
 from rich.console import Console
+
+_overlap_warned = False
+
+
+def warn_overlap_deprecated() -> None:
+    """Log a single deprecation warning for the removed overlap feature (spec-v3 §9.1).
+
+    Crossfade/overlap was replaced by the gapless persistent sink.  This is
+    emitted at most once per process, either from
+    :meth:`TTSBase.get_overlap_seconds` or from startup when a legacy
+    ``TTS_OVERLAP_SECONDS`` mapping is non-empty.
+    """
+    global _overlap_warned
+    if _overlap_warned:
+        return
+    _overlap_warned = True
+    logging.getLogger(__name__).warning(
+        "Per-sentence audio overlap/crossfade has been removed (gapless persistent "
+        "sink); get_overlap_seconds() now returns None and any configured overlap "
+        "value is ignored."
+    )
 
 
 class TTSBase(ABC):
@@ -177,11 +200,11 @@ class TTSBase(ABC):
 
     def get_overlap_seconds(self) -> float | None:
         """
-        Get the TTS-specific overlap seconds for this model.
+        Deprecated: per-sentence crossfade/overlap was removed (spec-v3 §9.1).
 
-        Returns:
-            float: Overlap seconds specific to this TTS model, or None to use default
+        The gapless persistent sink concatenates decoded PCM, so no overlap is
+        applied.  This method is kept only for backward compatibility with the
+        legacy per-file audio path and always returns ``None``.
         """
-        from .. import config
-
-        return config.TTS_OVERLAP_SECONDS.get(self.name)
+        warn_overlap_deprecated()
+        return None
