@@ -1,6 +1,6 @@
 # Lue - Voices and Languages Guide
 
-This document explains the speakers and languages included in the Edge, Kokoro, and OpenAI TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key.
+This document explains the speakers and languages included in the Edge, Kokoro, OpenAI, and gTTS TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key; gTTS is free (no key) but relies on an unofficial/rate-limited service.
 
 ***
 
@@ -14,11 +14,13 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
     "openai": "alloy",            # Default OpenAI voice
+    "gtts": "en",                 # Default gTTS language code
 }
 
 # Language settings for TTS models
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # Language code for Kokoro TTS
+    "gtts": "en",   # Language code for Google Translate TTS
 }
 ```
 
@@ -708,3 +710,35 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+***
+
+### gTTS (Google Translate TTS)
+
+`gTTS` wraps Google Translate's free text-to-speech endpoint. It needs **no API key**, only an internet connection.
+
+#### Setup
+
+1. Install the extra: `pip install 'lue-reader[free]'`
+2. Use with: `lue book.epub --tts gtts`
+
+#### Languages
+
+gTTS is selected by language code rather than a named voice. Pass one with `--voice`/`--lang`, or change `TTS_VOICES["gtts"]` in `lue/config.py`. Examples: `en`, `en-uk`, `fr`, `de`, `es`, `it`, `ja`, `zh-CN`.
+
+```bash
+lue book.epub --tts gtts --lang fr
+```
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). |
+| `LUE_GTTS_SLOW` | `false` | Set to `true`/`1` for slower speech. |
+| `LUE_GTTS_LANG` | `en` | Default language code when none is given. |
+
+#### Limitations
+
+- **No word-level timing**: sentence-level highlighting is used.
+- **Rate limits**: Google may throttle or temporarily block frequent requests. Avoid very large batches in quick succession.
+- **Unofficial endpoint**: relies on Google Translate's public TTS, which may change without notice.

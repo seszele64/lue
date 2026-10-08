@@ -18,3 +18,5 @@ edge-tts>=7.2.7
 # huggingface-hub>=0.34.4
 ## For OpenAI TTS (requires OPENAI_API_KEY):
 # openai>=1.0.0
+## For gTTS (Google Translate TTS; free, no API key, requires network):
+# gTTS>=2.5.0

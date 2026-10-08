@@ -53,6 +53,10 @@ os.environ.update(
         "LUE_TTS_PARALLEL_ENABLED": "False",
         "LUE_LOOKAHEAD_SENTENCES": "5",
         "LUE_TTS_MAX_CONCURRENT": "1",
+        # Pin gTTS options so tests do not depend on the host locale/settings.
+        "LUE_GTTS_LANG": "en",
+        "LUE_GTTS_TLD": "com",
+        "LUE_GTTS_SLOW": "false",
         # Suppress UI-related side effects.
         "LUE_SHOW_BUFFER_STATUS": "false",
         # Never let a test pick up a real provider credential.

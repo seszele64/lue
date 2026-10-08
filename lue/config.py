@@ -11,17 +11,31 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",
     "kokoro": "af_heart",
     "openai": "alloy",
+    "gtts": "en",  # free Google Translate TTS language code
 }
 
 # Language codes for TTS models that require them
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # a=English, e=Spanish, j=Japanese, etc.
+    "gtts": "en",  # BCP-47-ish language code for Google Translate TTS
 }
 
 # TTS model-specific seconds of overlap between sentences (overrides default OVERLAP_SECONDS if specified)
 TTS_OVERLAP_SECONDS = {
     "kokoro": 0.6,
 }
+
+# ── Free TTS providers (no API key required) ───────────────────────────────
+
+# gTTS (Google Translate TTS).
+GTTS_LANG = os.environ.get("LUE_GTTS_LANG", TTS_LANGUAGE_CODES["gtts"])
+GTTS_TLD = os.environ.get("LUE_GTTS_TLD", "com")
+GTTS_SLOW = os.environ.get("LUE_GTTS_SLOW", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # OpenAI TTS retry settings
 # Per-request generation timeout (seconds). Requests that exceed this
