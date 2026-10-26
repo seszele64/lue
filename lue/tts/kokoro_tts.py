@@ -81,7 +81,9 @@ class KokoroTTS(TTSBase):
             logging.error("SystemExit was called during Kokoro TTS import.")
             return False
         except ImportError as e:
-            package = str(e).split("'")[1]
+            message = str(e)
+            parts = message.split("'")
+            package = parts[1] if len(parts) > 1 else message
             self.console.print(f"[bold red]Error: '{package}' package not found.[/bold red]")
             self.console.print(f"[yellow]Please ensure torch, kokoro, soundfile, etc. are installed to use this TTS model.[/yellow]")
             logging.error(f"'{package}' is not installed for Kokoro TTS.")
