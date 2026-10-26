@@ -39,16 +39,20 @@ platformdirs.user_data_dir = lambda *args, **kwargs: os.path.join(_TEST_ROOT, "d
 
 # Low timeouts prevent hangs on network calls; zero retries make transient
 # failures surface immediately instead of delaying the suite; small delays
-# keep the retry-path tests fast.  LUE_OPENAI_TTS_TIMEOUT is pinned to the
+# keep the retry-path tests fast.  The *_TTS_TIMEOUT values are pinned to the
 # 5.0s floor that lue.config enforces via max(..., 5.0) -- any smaller value
 # would be clamped up to 5.0s anyway, so the effective test timeout is 5.0s.
 # Tests that need a shorter timeout monkeypatch lue.config.OPENAI_TTS_TIMEOUT
-# directly, which bypasses the clamp.
+# (or NANOGPT_TTS_TIMEOUT) directly, which bypasses the clamp.
 os.environ.update(
     {
         "LUE_OPENAI_TTS_TIMEOUT": "5",
         "LUE_OPENAI_TTS_MAX_RETRIES": "0",
         "LUE_OPENAI_TTS_RETRY_BASE_DELAY": "0.1",
+        # NanoGPT shares the same max(..., 5.0) clamp, so "5" is the floor.
+        "LUE_NANOGPT_TTS_TIMEOUT": "5",
+        "LUE_NANOGPT_TTS_MAX_RETRIES": "0",
+        "LUE_NANOGPT_TTS_RETRY_BASE_DELAY": "0.1",
         # Deterministic, single-threaded TTS behaviour.
         "LUE_TTS_PARALLEL_ENABLED": "False",
         "LUE_LOOKAHEAD_SENTENCES": "5",

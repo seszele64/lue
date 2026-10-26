@@ -80,19 +80,17 @@ class EdgeTTS(TTSBase):
         
         This method leverages Edge TTS's precise word boundary information
         through get_raw_timing_data() and processes it with the timing calculator.
+        Duration is inferred from the last word's end time rather than calling
+        ffprobe, eliminating a slow external process call.
         """
         # Get raw timing data (which also generates the audio)
         raw_timings = await self.get_raw_timing_data(text, output_path)
         
-        # Get actual audio duration
-        try:
-            from .. import audio
-        except ImportError:
-            import sys
-            import os
-            sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-            import audio
-        duration = await audio.get_audio_duration(output_path)
+        # Compute duration from raw timings — no ffprobe needed
+        if raw_timings:
+            duration = raw_timings[-1][2] + 0.15  # last word end + 150ms fade-out padding
+        else:
+            duration = 3.0  # reasonable fallback for very short/empty sentences
         
         # Process timing data using the centralized calculator
         try:
