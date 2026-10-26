@@ -1,7 +1,43 @@
 """Abstract base class for TTS models in the Lue eBook reader."""
 
 from abc import ABC, abstractmethod
+import logging
+
 from rich.console import Console
+
+_overlap_warned = False
+
+
+def warn_overlap_deprecated() -> None:
+    """Log a single deprecation warning for the superseded overlap API (spec-v3 §9.1).
+
+    Per-provider crossfade/overlap overrides are no longer honoured: providers
+    return ``None`` from :meth:`TTSBase.get_overlap_seconds`.  The warning is
+    emitted *lazily*, the first time that accessor is called (typically from
+    ``audio.py`` while scheduling a sentence), so a legacy
+    ``TTS_OVERLAP_SECONDS`` mapping alone does not produce a startup warning.
+
+    Playback behaviour therefore *does* change for providers that used to have
+    an override, and ``TTS_OVERLAP_SECONDS`` is now dead configuration.  The
+    legacy per-file path keeps applying ``config.OVERLAP_SECONDS`` (default
+    ``0.5``, overridable with ``--over``), scaled down as the playback speed
+    approaches ``3.0x``; a provider that previously lowered or raised the
+    overlap through ``TTS_OVERLAP_SECONDS`` silently falls through to that
+    global default.  Concretely, Kokoro's ``0.6`` entry no longer applies and
+    it now crossfades at ``0.5`` — a small, accepted regression until gapless
+    playback (spec-v3, see the gapless-persistent-sink PR) takes over overlap
+    scheduling entirely.
+    """
+    global _overlap_warned
+    if _overlap_warned:
+        return
+    _overlap_warned = True
+    logging.getLogger(__name__).warning(
+        "Per-provider audio overlap/crossfade has been removed (spec-v3 §9.1); "
+        "get_overlap_seconds() now returns None, so TTS_OVERLAP_SECONDS entries "
+        "are ignored (Kokoro's 0.6s falls through to 0.5s). The legacy per-file "
+        "playback path still uses config.OVERLAP_SECONDS (default 0.5s, see --over)."
+    )
 
 
 class TTSBase(ABC):
@@ -177,11 +213,11 @@ class TTSBase(ABC):
 
     def get_overlap_seconds(self) -> float | None:
         """
-        Get the TTS-specific overlap seconds for this model.
+        Deprecated: provider-specific crossfade/overlap overrides are ignored (spec-v3 §9.1).
 
-        Returns:
-            float: Overlap seconds specific to this TTS model, or None to use default
+        Returns ``None`` for backward compatibility with the legacy per-file
+        audio path, which then keeps using ``config.OVERLAP_SECONDS`` (default
+        ``0.5``) between sentences.
         """
-        from .. import config
-
-        return config.TTS_OVERLAP_SECONDS.get(self.name)
+        warn_overlap_deprecated()
+        return None

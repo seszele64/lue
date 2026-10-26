@@ -1,6 +1,6 @@
 # Lue - Voices and Languages Guide
 
-This document explains the speakers and languages included in the Edge, Kokoro, and OpenAI TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key.
+This document explains the speakers and languages included in the Edge, Kokoro, OpenAI, NanoGPT, Speechify, and gTTS TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI, NanoGPT, and Speechify require an API key; gTTS is free (no key) but relies on an unofficial/rate-limited service.
 
 ***
 
@@ -14,11 +14,15 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
     "openai": "alloy",            # Default OpenAI voice
+    "nanogpt": "Rex",             # Default NanoGPT voice
+    "speechify": "wren",          # Default Speechify voice
+    "gtts": "en",                 # Default gTTS language code (or set LUE_GTTS_LANG)
 }
 
 # Language settings for TTS models
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # Language code for Kokoro TTS
+    "gtts": "en",   # Fallback for TTS_VOICES["gtts"]
 }
 ```
 
@@ -708,6 +712,63 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+
+***
+
+### gTTS (Google Translate TTS)
+
+`gTTS` wraps Google Translate's free text-to-speech endpoint. It needs **no API key**, only an internet connection.
+
+#### Setup
+
+1. Install the extra: `pip install 'lue-reader[free]'`
+2. Use with: `lue book.epub --tts gtts`
+
+#### Languages
+
+gTTS is selected by a language code rather than a named voice. The value is resolved in this order — the first non-empty one wins:
+
+1. `--lang` (or `--voice`, which gTTS also treats as a language code)
+2. `LUE_GTTS_LANG` environment variable
+3. `TTS_VOICES["gtts"]` in `lue/config.py` (default: `en`) — the usual knob to change
+4. `TTS_LANGUAGE_CODES["gtts"]` in `lue/config.py` (fallback alias, default: `en`)
+
+Common codes: `en`, `fr`, `de`, `es`, `it`, `ja`, `zh-CN`. Deprecated regional tags such as `en-uk` are still accepted and fall back to `en`; for a British accent prefer `en` together with `LUE_GTTS_TLD=co.uk`.
+
+```bash
+# Per-run override
+lue book.epub --tts gtts --lang fr
+
+# New default for every run
+LUE_GTTS_LANG=de lue book.epub --tts gtts
+```
+
+Or edit the config default:
+
+```python
+# lue/config.py
+TTS_VOICES = {
+    ...
+    "gtts": "ja",  # Default gTTS language code
+}
+```
+
+An unsupported or malformed code is reported during startup and disables TTS for the session, rather than failing on every sentence.
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). Validated at startup: a value that does not look like `com`/`co.uk`/`de` disables gTTS for the session instead of failing on every sentence. |
+| `LUE_GTTS_SLOW` | `false` | Set to `true`/`1` for slower speech. |
+| `LUE_GTTS_LANG` | `en` | Default language code; overrides `TTS_VOICES["gtts"]`. |
+| `LUE_GTTS_TIMEOUT` | `30` | Timeout in seconds for each 100-character chunk request (floored at `5`). The overall budget for a sentence is `chunks × this value + 10s`, so long sentences are not aborted while later chunks are still in flight. A sentence that exceeds its budget is retried by the audio pipeline. |
+
+#### Limitations
+
+- **No word-level timing**: sentence-level highlighting is used.
+- **Rate limits**: Google may throttle or temporarily block frequent requests. Avoid very large batches in quick succession.
+- **Unofficial endpoint**: relies on Google Translate's public TTS, which may change without notice.
 
 ***
 
