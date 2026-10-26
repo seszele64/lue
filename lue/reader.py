@@ -1202,13 +1202,17 @@ class Lue:
                         pass
 
                 # When pausing, snapshot the audible position so resume is exact.
+                # On resume the snapshot is deliberately left untouched: the
+                # producer of the resumed generation consumes and clears it
+                # (``audio._producer_loop_sink``).  Wiping it here would make
+                # every resume restart at the sentence start.
                 if self.is_paused:
                     self._resume = self._snapshot_resume_position()
-                else:
-                    self._resume = None
 
-                # Stop current audio playback
-                await audio.stop_and_clear_audio(self)
+                # Stop current audio playback.  ``preserve_resume`` keeps the
+                # pause snapshot across teardown; navigation/shutdown callers
+                # use the default so a stale position never leaks.
+                await audio.stop_and_clear_audio(self, preserve_resume=True)
 
                 # Only start playback if we're not paused and still running
                 if not self.is_paused and self.running and self.tts_model:

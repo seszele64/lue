@@ -117,11 +117,18 @@ def _remove_session_dir(reader):
     reader._session_dir = None
 
 
-async def stop_and_clear_audio(reader):
+async def stop_and_clear_audio(reader, *, preserve_resume: bool = False):
     """Single-source-of-truth teardown (spec-v3 §5.2).
 
     Runs the ten steps in order.  Shared by ``_restart_audio_after_navigation``,
     ``_handle_pause_toggle``, ``_switch_book`` and ``_shutdown``.
+
+    ``_resume`` ownership: a pause snapshots it *before* calling this function
+    and passes ``preserve_resume=True`` so the snapshot survives until the
+    producer of the resumed generation consumes and clears it.  Every other
+    caller (book switch, navigation restart, shutdown, stop) uses the default
+    and drops the snapshot so a stale position can never leak across books or
+    generations.
     """
     # 1. Invalidate every in-flight loop.
     reader.audio_generation += 1
@@ -242,6 +249,11 @@ async def stop_and_clear_audio(reader):
     reader._sink_eof_intended = False
     reader._current_decoder = None
 
+    # A pause snapshot is handed to the next producer; everything else
+    # invalidates it (see the docstring).
+    if not preserve_resume:
+        reader._resume = None
+
     # 10. Delete the session temp dir.
     _remove_session_dir(reader)
 
@@ -358,6 +370,11 @@ async def _start_legacy(reader):
     reader.player_task = None
     await asyncio.sleep(0.05)
 
+    # The legacy player cannot seek into a sentence; a resume snapshot taken
+    # on the sink path (or one surviving a pause across a fallback) would
+    # otherwise leak into a later sink generation.  Drop it here.
+    reader._resume = None
+
     reader.pipeline = create_pipeline(reader)
     reader.tts_cache = reader.pipeline.cache
     reader.lookahead_buffer = reader.pipeline.buffer
@@ -414,13 +431,28 @@ async def _sink_supervisor(reader, gen):
 # ── Persistent producer (§13) ──────────────────────────────────────────────
 
 
+async def _put_eof_sentinel(reader, gen):
+    """Hand ``EOF_SENTINEL`` to the writer, retrying until it is accepted.
+
+    The decode queue is bounded, so a single ``wait_for`` put can time out
+    while the writer is busy with a sentence.  Dropping that sentinel leaves
+    the writer padding silence forever (playback never finishes), so retry
+    every 50 ms until there is room.  The wait is bounded by the generation
+    token and ``reader.running``: teardown bumps the generation *before*
+    cancelling the producer, so shutdown never blocks here.
+    """
+    while reader.running and gen == reader.audio_generation:
+        try:
+            reader.decode_queue.put_nowait(audio_sink.EOF_SENTINEL)
+            return
+        except asyncio.QueueFull:
+            await asyncio.sleep(0.05)
+
+
 async def _producer_loop_sink(reader, gen):
     """Generate TTS files and enqueue :class:`DecodeJob` objects."""
     if not reader.tts_model or not reader.tts_model.initialized:
-        try:
-            await asyncio.wait_for(reader.decode_queue.put(audio_sink.EOF_SENTINEL), timeout=0.5)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            pass
+        await _put_eof_sentinel(reader, gen)
         return
 
     resume = reader._resume
@@ -539,14 +571,12 @@ async def _producer_loop_sink(reader, gen):
     except asyncio.CancelledError:
         pass
     finally:
-        # Only signal EOF for the still-current generation (teardown bumps gen).
+        # Only signal EOF for the still-current generation (teardown bumps
+        # the generation *before* cancelling us, so a stale producer does not
+        # block).  The writer must always see the sentinel, otherwise it keeps
+        # padding silence and playback never ends.
         if gen == reader.audio_generation:
-            try:
-                await asyncio.wait_for(
-                    reader.decode_queue.put(audio_sink.EOF_SENTINEL), timeout=1.0
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            await _put_eof_sentinel(reader, gen)
 
 
 # ── Legacy per-file loops (preserved behind the flag) ──────────────────────
@@ -672,6 +702,13 @@ async def _player_loop(reader):
             except Exception:
                 pass
 
+    # Last per-sentence ffplay task.  The legacy path must never overlap two
+    # ``ffplay`` processes: the pacing sleep is measured from spawn time, not
+    # from the moment ffplay actually starts, so a slow start (or cached
+    # audio) could otherwise stack the next sentence on top of the previous
+    # one.  Every iteration awaits this before spawning a replacement.
+    last_playback_task = None
+
     try:
         while reader.running:
             try:
@@ -732,8 +769,19 @@ async def _player_loop(reader):
                             cmd.extend(['-af', filter_chain])
 
                     cmd.append(audio_file)
+                    # Serialise ffplay instances: wait for the previous
+                    # sentence's process to exit before starting this one.
+                    if last_playback_task is not None:
+                        try:
+                            await last_playback_task
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:  # noqa: BLE001 - a dead player is not fatal
+                            pass
                     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                     reader.playback_processes.append(process)
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     mark_done()
                     await signal_refill()
@@ -743,6 +791,16 @@ async def _player_loop(reader):
                     task = asyncio.current_task()
                     try:
                         await proc.wait()
+                    except asyncio.CancelledError:
+                        # Awaiting this task is how the player serialises
+                        # ffplay; a pause/stop cancels the player, so stop the
+                        # sentence immediately instead of letting it finish.
+                        try:
+                            if proc.returncode is None:
+                                proc.terminate()
+                        except (ProcessLookupError, AttributeError):
+                            pass
+                        raise
                     except Exception: pass
                     finally:
                         try:
@@ -759,27 +817,19 @@ async def _player_loop(reader):
 
                 playback_task = asyncio.create_task(await_and_remove(process, audio_file))
                 reader.active_playback_tasks.append(playback_task)
-                # Dynamic overlap based on playback speed.  ``get_overlap_seconds()``
-                # now returns None (gapless does not use it), so this falls back to
-                # ``config.OVERLAP_SECONDS`` (0.0 in this branch).
-                base_overlap = config.OVERLAP_SECONDS
-                if reader.tts_model and hasattr(reader.tts_model, 'get_overlap_seconds'):
-                    tts_overlap = reader.tts_model.get_overlap_seconds()
-                    if tts_overlap is not None:
-                        base_overlap = tts_overlap
+                last_playback_task = playback_task
 
-                # Apply speed-based overlap reduction
-                speed = reader.playback_speed
-                if speed >= 3.0:
-                    overlap_seconds = 0.0
-                else:
-                    overlap_factor = max(0.0, min(1.0, (3.0 - speed) / (3.0 - 1.0)))
-                    overlap_seconds = base_overlap * overlap_factor
-
-                # Adjust duration for playback speed
+                # The legacy path is strictly serial: per-sentence ``ffplay``
+                # has no gapless crossfade, so overlapping two files would
+                # play them at the same time.  Pace by the full sentence
+                # duration at the current speed (0.1 s floor so the UI and
+                # command loop keep breathing).  The next iteration awaits
+                # ``last_playback_task`` before spawning, so a slow ffplay
+                # start can never stack up.
+                speed = reader.playback_speed or 1.0
                 actual_duration = duration / speed
 
-                await asyncio.sleep(max(0.1, actual_duration - overlap_seconds))
+                await asyncio.sleep(max(0.1, actual_duration))
                 mark_done()
                 await signal_refill()
             except asyncio.TimeoutError:
