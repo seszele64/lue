@@ -726,15 +726,20 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 
 1. Install the extra (the SDK is a git dependency, not on PyPI, and the extra
    only resolves from a source checkout — see the note below):
-   `pip install 'lue-reader[capcut]'`
+   `pip install '.[capcut]'`
 2. Use it: `lue book.epub --tts capcut`
 
 > **PyPI note.** The `capcut` extra contains a PEP 508 direct URL
 > (`capcut-tts-api @ git+…`). PyPI rejects published metadata with direct URL
 > requirements, so this extra exists only in the source tree and is **not
 > available from a PyPI install**. From a source checkout, either use the extra
-> as shown above, or install the pinned SDK manually and then Lue:
-> `pip install "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07"`
+> as shown above, or install the pinned SDK and then Lue itself (both steps are
+> required — the SDK alone does not install Lue):
+>
+> ```bash
+> pip install "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07"
+> pip install .            # or: pip install -e .
+> ```
 
 The provider produces MP3 audio and does **not** expose word-level timing, so Lue uses sentence-level highlighting for it.
 
@@ -770,7 +775,7 @@ CapCut voices are numeric resource IDs exposed by the SDK's catalogue (`data/Voi
 - **Unofficial API**: reverse-engineered and subject to change without notice; not affiliated with CapCut/ByteDance.
 - **Device spoofing & ToS**: the SDK impersonates the CapCut desktop client; use may breach CapCut's terms and consume account credits.
 - **Rate limits / credits**: CapCut may throttle requests or exhaust free credits; avoid large batches in quick succession.
-- **Git-only dependency**: installs from GitHub, so it requires network access at install time. The `capcut` extra pins an immutable commit SHA for reproducibility; if you install manually, replicate the pin: `pip install 'git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07'`. PyPI has no `capcut-tts-api` release, so only installers that understand PEP 508 `git+` URLs (pip, uv) can resolve this extra.
+- **Git-only dependency**: installs from GitHub, so it requires network access at install time. The `capcut` extra pins an immutable commit SHA for reproducibility; if you install manually, replicate the pin and then install Lue itself: `pip install 'git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07' && pip install .`. PyPI has no `capcut-tts-api` release, so only installers that understand PEP 508 `git+` URLs (pip, uv) can resolve this extra; the extra is never uploaded to PyPI.
 
 ***
 
