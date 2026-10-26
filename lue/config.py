@@ -1,6 +1,7 @@
 """Configuration settings for the Lue eBook reader."""
 
 import logging
+import math
 import os
 from platformdirs import user_data_dir, user_cache_dir
 
@@ -115,13 +116,16 @@ _capcut_retry_delay_raw = float(os.environ.get("LUE_CAPCUT_TTS_RETRY_BASE_DELAY"
 CAPCUT_TTS_RETRY_BASE_DELAY = max(_capcut_retry_delay_raw, 0.5) if _capcut_retry_delay_raw > 0 else 2.0
 
 # Speaking rate passed through to CapCut as a string (e.g. "1.0", "1.2").
-# Parsed as a float and clamped to the range CapCut accepts (0.5-2.0); an
-# unparseable value falls back to 1.0 rather than crashing at import time.
+# Parsed as a float and clamped to the range CapCut accepts (0.5-2.0).  An
+# unparseable or non-finite value ("nan", "inf") falls back to 1.0: float()
+# accepts those, and they would otherwise poison the clamp below (nan compares
+# false against every bound, so it would survive as "nan").
 try:
     _capcut_rate_raw = float(os.environ.get("LUE_CAPCUT_TTS_RATE", "1.0"))
 except (TypeError, ValueError):
-    import logging
+    _capcut_rate_raw = float("nan")
 
+if not math.isfinite(_capcut_rate_raw):
     logging.getLogger(__name__).warning(
         "Invalid LUE_CAPCUT_TTS_RATE=%r; falling back to 1.0.",
         os.environ.get("LUE_CAPCUT_TTS_RATE"),

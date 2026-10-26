@@ -67,21 +67,41 @@ class FakeCapCutClient:
     def list_voices(self):
         return self._voices
 
-    def create_tts_task(self, text, voice="BV074_streaming", resource_id=None, rate="1.0"):
-        # Mirrors capcut_tts_api.CapCutClient.create_tts_task's signature.
+    def _record_create(self, text, voice, resource_id, rate, rate_passed):
         self.create_calls += 1
-        self.create_args.append(
-            {"text": text, "voice": voice, "resource_id": resource_id, "rate": rate}
-        )
+        entry = {"text": text, "voice": voice, "resource_id": resource_id}
+        if rate_passed:
+            entry["rate"] = rate
+        self.create_args.append(entry)
         if self.fail_create_times and self.create_calls <= self.fail_create_times:
             raise self.create_exc or ConnectionError("transient")
         return self._create
+
+    def create_tts_task(self, text, voice="BV074_streaming", resource_id=None, rate="1.0"):
+        # Mirrors capcut_tts_api.CapCutClient.create_tts_task's signature.
+        return self._record_create(text, voice, resource_id, rate, True)
 
     def query_tts_task(self, task_id, token):
         self.query_calls += 1
         if self.query_exc is not None:
             raise self.query_exc
         return self._query
+
+
+class FakeCapCutClientNoRate(FakeCapCutClient):
+    """Mirrors the pinned SDK (capcut-tts-api 1.5.0): no ``rate`` parameter."""
+
+    def create_tts_task(self, text, voice="BV074_streaming", resource_id=None):
+        return self._record_create(text, voice, resource_id, None, False)
+
+
+class FakeStatusError(Exception):
+    """Duck-typed stand-in for ``capcut_tts_api.CapCutAPIError``."""
+
+    def __init__(self, status, message="boom"):
+        super().__init__(message)
+        self.status_code = status
+        self.response_data = {}
 
 
 def install_fake_sdk(monkeypatch, client) -> None:
@@ -91,16 +111,36 @@ def install_fake_sdk(monkeypatch, client) -> None:
     monkeypatch.setitem(sys.modules, "capcut_tts_api", module)
 
 
+def printed_text(console) -> str:
+    """Return everything a ``Mock`` console printed, as one string."""
+    parts = []
+    for call in console.print.call_args_list:
+        parts.extend(str(arg) for arg in call.args)
+        parts.extend(str(value) for value in call.kwargs.values())
+    return "\n".join(parts)
+
+
 #: Minimal bytes that satisfy the provider's MP3 magic check (ID3 tag).
 MP3_MAGIC = b"ID3\x03\x00\x00\x00\x00\x00\x00"
 
 
 def install_fake_requests(
-    monkeypatch, payload: bytes = MP3_MAGIC, status: int = 200, headers: dict | None = None
+    monkeypatch,
+    payload: bytes = MP3_MAGIC,
+    status: int = 200,
+    headers: dict | None = None,
+    redirects: dict[str, str] | None = None,
 ) -> dict:
-    """Inject a minimal synchronous ``requests`` module and return its calls."""
+    """Inject a minimal synchronous ``requests`` module and record its calls.
+
+    ``redirects`` maps a request URL to the ``Location`` it answers with
+    (HTTP 302, empty body).  Every other URL answers with ``status`` and
+    ``payload``.  The returned dict records the requested URLs in order, the
+    ``allow_redirects`` flag of every call and the last ``timeout``.
+    """
     module = types.ModuleType("requests")
-    calls: dict = {"url": None}
+    calls: dict = {"url": None, "urls": [], "allow_redirects": [], "timeout": None}
+    redirect_map = dict(redirects or {})
 
     class RequestException(Exception):
         pass
@@ -122,9 +162,10 @@ def install_fake_requests(
     )
 
     class FakeResponse:
-        def __init__(self):
-            self.status_code = status
-            self.headers = dict(headers or {})
+        def __init__(self, status_code, response_headers, body):
+            self.status_code = status_code
+            self.headers = dict(response_headers)
+            self._body = body
 
         def __enter__(self):
             return self
@@ -133,16 +174,23 @@ def install_fake_requests(
             return False
 
         def raise_for_status(self):
-            if status >= 400:
-                raise HTTPError(f"HTTP {status}")
+            if self.status_code >= 400:
+                raise HTTPError(f"HTTP {self.status_code}")
 
         def iter_content(self, chunk_size=8192):
-            yield payload
+            if self._body:
+                yield self._body
 
-    def get(url, stream=True, timeout=None):
+    def get(url, stream=True, timeout=None, allow_redirects=True):
         calls["url"] = url
+        calls["urls"].append(url)
+        calls["allow_redirects"].append(allow_redirects)
         calls["timeout"] = timeout
-        return FakeResponse()
+        if url in redirect_map:
+            return FakeResponse(
+                302, {"Location": redirect_map[url]}, b""
+            )
+        return FakeResponse(status, headers or {}, payload)
 
     module.get = get
     monkeypatch.setitem(sys.modules, "requests", module)
@@ -212,8 +260,57 @@ async def test_initialize_warns_on_empty_voice_list(monkeypatch, mock_console):
     instance = CapCutTTS(mock_console, voice="custom_voice")
     assert await instance.initialize() is True
     assert instance.initialized is True
-    # A warning must have been printed for the empty catalogue.
-    assert mock_console.print.called
+    # A warning must name the empty catalogue and the voice in use.  The old
+    # indentation bug skipped this block entirely, so asserting the text (not
+    # just that print was called) is what guards the regression.
+    text = printed_text(mock_console)
+    assert "empty voice list" in text
+    assert "custom_voice" in text
+
+
+@pytest.mark.asyncio
+async def test_initialize_no_empty_voice_warning_for_fallback(monkeypatch, mock_console):
+    """The empty-catalogue warning must not fire for the built-in fallback."""
+    client = FakeCapCutClient(voices=[])
+    install_fake_sdk(monkeypatch, client)
+    instance = CapCutTTS(mock_console)
+    assert instance.voice == "BV074_streaming"
+    assert await instance.initialize() is True
+    assert "empty voice list" not in printed_text(mock_console)
+
+
+@pytest.mark.asyncio
+async def test_rate_unsupported_warns_and_is_omitted(monkeypatch, mock_console, tmp_output_dir):
+    """The pinned SDK has no ``rate`` param: warn once, never raise TypeError."""
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_RATE", "1.25")
+    client = FakeCapCutClientNoRate()
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch, payload=b"ID3RATE")
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+    assert instance._rate_supported is False
+
+    text = printed_text(mock_console)
+    assert "does not support a speaking rate" in text
+    assert "1.25" in text
+
+    out = tmp_output_dir / "rate.mp3"
+    await instance.generate_audio("Hi.", str(out))
+    assert out.read_bytes() == b"ID3RATE"
+    assert client.create_args == [
+        {"text": "Hi.", "voice": "BV074_streaming", "resource_id": None}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_rate_warning_for_default_rate(monkeypatch, mock_console):
+    """An unsupported rate is only worth a warning when it was customised."""
+    client = FakeCapCutClientNoRate()
+    install_fake_sdk(monkeypatch, client)
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+    assert "speaking rate" not in printed_text(mock_console)
 
 
 # ── Generation ─────────────────────────────────────────────────────────────
@@ -233,6 +330,7 @@ async def test_generate_writes_bytes(monkeypatch, mock_console, tmp_output_dir):
 
     assert out.read_bytes() == payload
     assert req_calls["url"] == "https://cdn.test/a.mp3"
+    assert req_calls["allow_redirects"] == [False]
     assert client.create_calls == 1
     assert client.query_calls == 1
     # No leftover per-attempt temp files.
@@ -365,15 +463,140 @@ async def test_download_enforces_size_cap(monkeypatch, mock_console, tmp_output_
     monkeypatch.setattr("lue.tts.capcut_tts._MAX_DOWNLOAD_BYTES", 8)
     client = FakeCapCutClient()
     install_fake_sdk(monkeypatch, client)
-    install_fake_requests(monkeypatch, payload=b"X" * 100)
+    # Valid MP3 magic plus an oversized body: the cap must trip during the
+    # stream, so the payload is never mistaken for a corrupt file.
+    install_fake_requests(monkeypatch, payload=b"ID3" + b"X" * 100)
 
     instance = CapCutTTS(mock_console)
     assert await instance.initialize() is True
 
     out = tmp_output_dir / "out.mp3"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="limit"):
         await instance.generate_audio("Hi.", str(out))
     assert not out.exists()
+    assert not list(tmp_output_dir.glob("*.part"))
+
+
+@pytest.mark.asyncio
+async def test_download_follows_https_redirect(monkeypatch, mock_console, tmp_output_dir):
+    """A redirect is followed hop by hop with automatic redirects disabled."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    calls = install_fake_requests(
+        monkeypatch,
+        payload=b"ID3REDIR",
+        redirects={"https://cdn.test/a.mp3": "https://cdn2.test/b.mp3"},
+    )
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    out = tmp_output_dir / "redir.mp3"
+    await instance.generate_audio("Hi.", str(out))
+
+    assert out.read_bytes() == b"ID3REDIR"
+    assert calls["urls"] == ["https://cdn.test/a.mp3", "https://cdn2.test/b.mp3"]
+    assert calls["allow_redirects"] == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_download_relative_redirect_is_resolved(monkeypatch, mock_console, tmp_output_dir):
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    calls = install_fake_requests(
+        monkeypatch,
+        payload=b"ID3REL",
+        redirects={"https://cdn.test/a.mp3": "/moved/b.mp3"},
+    )
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    out = tmp_output_dir / "rel.mp3"
+    await instance.generate_audio("Hi.", str(out))
+
+    assert out.read_bytes() == b"ID3REL"
+    assert calls["urls"] == ["https://cdn.test/a.mp3", "https://cdn.test/moved/b.mp3"]
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_redirect_downgrade(monkeypatch, mock_console, tmp_output_dir):
+    """A redirect to plain HTTP must be refused before it is requested."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    calls = install_fake_requests(
+        monkeypatch,
+        redirects={"https://cdn.test/a.mp3": "http://evil.test/a.mp3"},
+    )
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    out = tmp_output_dir / "downgrade.mp3"
+    with pytest.raises(ValueError, match="non-HTTPS"):
+        await instance.generate_audio("Hi.", str(out))
+
+    # The downgrade was never requested, and it is terminal (no retry).
+    assert calls["urls"] == ["https://cdn.test/a.mp3"]
+    assert client.create_calls == 1
+    assert not out.exists()
+
+
+@pytest.mark.asyncio
+async def test_download_rejects_redirect_without_location(monkeypatch, mock_console, tmp_output_dir):
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch, redirects={"https://cdn.test/a.mp3": ""})
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    with pytest.raises(ValueError, match="Location"):
+        await instance.generate_audio("Hi.", str(tmp_output_dir / "out.mp3"))
+
+
+@pytest.mark.asyncio
+async def test_download_redirect_chain_is_bounded(monkeypatch, mock_console, tmp_output_dir):
+    """More than ``_MAX_REDIRECTS`` hops is an error, not an infinite loop."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    redirects = {
+        "https://cdn.test/a.mp3": "https://cdn.test/r1.mp3",
+        "https://cdn.test/r1.mp3": "https://cdn.test/r2.mp3",
+        "https://cdn.test/r2.mp3": "https://cdn.test/r3.mp3",
+        "https://cdn.test/r3.mp3": "https://cdn.test/r4.mp3",
+    }
+    calls = install_fake_requests(monkeypatch, redirects=redirects)
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    with pytest.raises(ValueError, match="redirects"):
+        await instance.generate_audio("Hi.", str(tmp_output_dir / "loop.mp3"))
+
+    assert len(calls["urls"]) == 4  # initial request + 3 hops
+    assert client.create_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_part_files_are_swept(monkeypatch, mock_console, tmp_output_dir):
+    """Orphans from a timed-out attempt must not survive a later success."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch, payload=b"ID3SWEEP")
+
+    out = tmp_output_dir / "out.mp3"
+    orphan = tmp_output_dir / f"{out.name}.4242-deadbeef.part"
+    orphan.write_bytes(b"junk from an orphaned worker")
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    await instance.generate_audio("Hi.", str(out))
+
+    assert out.read_bytes() == b"ID3SWEEP"
+    assert not orphan.exists()
+    assert not list(tmp_output_dir.glob("*.part"))
 
 
 class TestSdkParsers:
@@ -478,6 +701,53 @@ async def test_task_error_retried_then_success(monkeypatch, mock_console, tmp_ou
     assert client.create_calls == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 401, 403, 404])
+async def test_client_error_status_is_terminal(
+    status, monkeypatch, mock_console, tmp_output_dir
+):
+    """4xx (other than 408/409/429) must not be retried."""
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_MAX_RETRIES", 2)
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_RETRY_BASE_DELAY", 0.1)
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_TIMEOUT", 5)
+
+    client = FakeCapCutClient(fail_create_times=999, create_exc=FakeStatusError(status))
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch)
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    with pytest.raises(FakeStatusError):
+        await instance.generate_audio("Hello.", str(tmp_output_dir / "out.mp3"))
+
+    assert client.create_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_server_error_status_is_retried(
+    status, monkeypatch, mock_console, tmp_output_dir
+):
+    """429 and 5xx are transient: exhaust every configured attempt."""
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_MAX_RETRIES", 2)
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_RETRY_BASE_DELAY", 0.1)
+    monkeypatch.setattr("lue.config.CAPCUT_TTS_TIMEOUT", 5)
+    monkeypatch.setattr(random, "random", Mock(return_value=0.5))
+
+    client = FakeCapCutClient(fail_create_times=999, create_exc=FakeStatusError(status))
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch)
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    with pytest.raises(FakeStatusError):
+        await instance.generate_audio("Hello.", str(tmp_output_dir / "out.mp3"))
+
+    assert client.create_calls == 3  # attempts 0, 1, 2
+
+
 # ── URL extraction ─────────────────────────────────────────────────────────
 
 class TestExtractAudioUrl:
@@ -544,6 +814,41 @@ class TestShouldRetry:
         exc_400.status_code = 400
         assert CapCutTTS._should_retry(exc_400) is False
 
+        exc_404 = RuntimeError("not found")
+        exc_404.status_code = 404
+        assert CapCutTTS._should_retry(exc_404) is False
+
+    def test_status_policy_before_name_fallback(self):
+        """A named retryable error that carries a 4xx status is terminal."""
+        FakeReadTimeout = type("ReadTimeout", (Exception,), {})
+        exc = FakeReadTimeout("timeout, but the server said 400")
+        exc.status_code = 400
+        assert CapCutTTS._should_retry(exc) is False
+
+        exc_429 = FakeReadTimeout("rate limited")
+        exc_429.status_code = 429
+        assert CapCutTTS._should_retry(exc_429) is True
+
+    def test_http_error_without_status_is_terminal(self, monkeypatch):
+        install_fake_requests(monkeypatch)
+        import requests
+
+        assert CapCutTTS._should_retry(requests.exceptions.HTTPError("no status")) is False
+
+    def test_requests_transport_error_is_retryable(self, monkeypatch):
+        install_fake_requests(monkeypatch)
+        import requests
+
+        assert CapCutTTS._should_retry(requests.exceptions.ConnectionError("x")) is True
+        assert CapCutTTS._should_retry(requests.exceptions.Timeout("x")) is True
+
+    def test_capcut_api_error_without_status_is_retryable(self):
+        """An SDK error carrying status_code=0 comes from a 200/ret!=0 body."""
+        FakeAPIError = type("CapCutAPIError", (Exception,), {})
+        exc = FakeAPIError("application-level failure")
+        exc.status_code = 0
+        assert CapCutTTS._should_retry(exc) is True
+
     def test_name_based_fallback(self):
         FakeSign = type("SignError", (Exception,), {})
         assert CapCutTTS._should_retry(FakeSign()) is False
@@ -577,6 +882,22 @@ def test_config_rate_clamps_out_of_range(monkeypatch):
     try:
         reloaded = importlib.reload(config)
         assert reloaded.CAPCUT_TTS_RATE == "2.0"
+    finally:
+        monkeypatch.delenv("LUE_CAPCUT_TTS_RATE", raising=False)
+        importlib.reload(config)
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "not-a-number"])
+def test_config_rate_non_finite_falls_back(monkeypatch, raw):
+    """``float('nan')`` passes float() and defeats the clamp, so it is caught."""
+    import importlib
+
+    from lue import config
+
+    monkeypatch.setenv("LUE_CAPCUT_TTS_RATE", raw)
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.CAPCUT_TTS_RATE == "1.0"
     finally:
         monkeypatch.delenv("LUE_CAPCUT_TTS_RATE", raising=False)
         importlib.reload(config)

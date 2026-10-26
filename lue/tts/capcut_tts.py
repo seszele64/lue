@@ -22,12 +22,16 @@ synchronous); :meth:`generate_audio` offloads the blocking work to a thread.
 from __future__ import annotations
 
 import asyncio
+import glob
+import inspect
 import json
 import logging
 import os
 import random
 import time
+import uuid
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 from rich.console import Console
 
@@ -61,6 +65,17 @@ _TERMINAL_STATUSES = frozenset(
 #: must not be able to stream unbounded data onto disk.
 _MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
+#: Maximum number of HTTP redirects followed while downloading audio.  Every
+#: hop is re-validated as HTTPS, so a redirect cannot downgrade the transfer.
+_MAX_REDIRECTS = 3
+
+#: HTTP statuses that carry a ``Location`` header for the download.
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+#: HTTP statuses that are worth retrying on top of 5xx: request timeout,
+#: version conflict and rate limiting.
+_RETRYABLE_STATUSES = frozenset({408, 409, 429})
+
 #: Keys that may hold the task id in a ``create_tts_task`` response.
 _ID_KEYS = ("id", "task_id", "taskId", "taskID")
 #: Keys that may hold the task token in a ``create_tts_task`` response.
@@ -81,6 +96,8 @@ _URL_KEYS = (
 )
 
 #: ``__cause__``-free, name-based retry hints (duck-typed SDK stand-ins).
+#: ``HTTPError`` is deliberately absent: it is classified explicitly via its
+#: HTTP status, so a status-less one is treated as terminal.
 _RETRYABLE_EXC_NAMES = frozenset(
     {
         "RequestException",
@@ -91,7 +108,10 @@ _RETRYABLE_EXC_NAMES = frozenset(
         "SSLError",
         "ChunkedEncodingError",
         "ProxyError",
-        "HTTPError",
+        # SDK-level failure.  Reaches this fallback only when no usable HTTP
+        # status was carried (a 4xx would already have been classified as
+        # terminal), e.g. an application-level ret!=0 on an HTTP 200 response.
+        "CapCutAPIError",
     }
 )
 
@@ -119,6 +139,46 @@ class SignError(CapCutTTSError):
     """CapCut request signing failed.  Terminal — never retried."""
 
 
+# ── HTTP status policy ─────────────────────────────────────────────────────
+
+def _status_of(exc: BaseException) -> int | None:
+    """Best-effort HTTP status code carried by ``exc``.
+
+    Handles the SDK-style top-level ``status_code`` attribute used by
+    ``capcut_tts_api.CapCutAPIError`` and the ``response.status_code`` pair
+    used by ``requests``.  Non-integer placeholders (``Mock``, strings,
+    ``bool``) are ignored.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+
+    return None
+
+
+def _status_is_retryable(status: int | None) -> bool | None:
+    """Tri-state verdict for an HTTP status code.
+
+    * ``True``  — 408, 409, 429 or any 5xx server error.
+    * ``False`` — any other 4xx client error (400/401/403/404 are terminal).
+    * ``None``  — no status, or a non-error status such as 200, so no verdict
+      can be given and the caller should fall through to the next check.
+    """
+    if status is None:
+        return None
+    if status in _RETRYABLE_STATUSES:
+        return True
+    if 500 <= status < 600:
+        return True
+    if 400 <= status < 500:
+        return False
+    return None
+
+
 class CapCutTTS(TTSBase):
     """TTS implementation for CapCut's online text-to-speech service."""
 
@@ -138,6 +198,8 @@ class CapCutTTS(TTSBase):
     def __init__(self, console: Console, voice: str = None, lang: str = None):
         super().__init__(console, voice, lang)
         self._client = None
+        # Set by ``initialize`` after probing the installed SDK signature.
+        self._rate_supported = False
         self.resource_id = config.CAPCUT_RESOURCE_ID
         # ``self.voice`` (from TTSBase) is the single source of truth for the
         # selected voice; fall back to the configured default when unset.
@@ -201,6 +263,29 @@ class CapCutTTS(TTSBase):
                     f"using '{self.voice}' anyway.[/bold yellow]"
                 )
 
+        # The pinned SDK revision (v1.5.0) has no ``rate`` parameter on
+        # ``create_tts_task``.  Silently dropping a user-configured rate would
+        # make the setting look broken, so say so once, at start-up.
+        self._rate_supported = self._accepts_rate(client.create_tts_task)
+        rate = config.CAPCUT_TTS_RATE
+        # ``config`` always yields a numeric string, but a monkeypatched value
+        # must not turn startup into a crash.
+        try:
+            rate_is_default = float(rate) == 1.0
+        except (TypeError, ValueError):
+            rate_is_default = False
+        if not self._rate_supported and not rate_is_default:
+            self.console.print(
+                "[bold yellow]Warning: the installed CapCut SDK does not support "
+                f"a speaking rate; LUE_CAPCUT_TTS_RATE={rate} will be "
+                "ignored.[/bold yellow]"
+            )
+            logging.warning(
+                "Installed capcut-tts-api has no 'rate' parameter; "
+                "LUE_CAPCUT_TTS_RATE=%s will be ignored.",
+                rate,
+            )
+
         self._client = client
         self.voice = self.voice or config.TTS_VOICES.get(self.name)
         self.initialized = True
@@ -214,13 +299,15 @@ class CapCutTTS(TTSBase):
         Applies a per-request wall-clock timeout and exponential-backoff retry
         for transient failures (network errors, task failures, rate limits).
 
-        Each attempt writes to its own ``<output_path>.<attempt>.part`` file and
-        only publishes it with :func:`os.replace` once the download succeeds.
-        ``asyncio.wait_for`` cannot cancel the worker thread that
+        Each attempt writes to its own unique ``<output_path>.<pid>-<uuid>.part``
+        file and only publishes it with :func:`os.replace` once the download
+        succeeds.  ``asyncio.wait_for`` cannot cancel the worker thread that
         ``asyncio.to_thread`` started, so a timed-out attempt keeps running in
-        the background; giving every attempt a distinct temp file stops that
-        orphan from clobbering the file a later attempt is writing, and
-        ``os.replace`` guarantees readers never observe a half-written MP3.
+        the background; a per-attempt unique name means that orphan can never
+        collide with the file a later attempt (or another process) is writing,
+        and ``os.replace`` guarantees readers never observe a half-written MP3.
+        Stale ``.part`` files for this output are swept after every attempt so
+        orphaned workers cannot leave litter behind.
         """
         if not self.initialized or self._client is None:
             raise RuntimeError("CapCut TTS has not been initialized.")
@@ -235,9 +322,11 @@ class CapCutTTS(TTSBase):
         last_exception: BaseException | None = None
 
         for attempt in range(CAPCUT_TTS_MAX_RETRIES + 1):
-            # Per-attempt temp file: an orphaned worker from an earlier timed-out
-            # attempt can never race with this one on the same path.
-            tmp_path = f"{output_path}.{attempt}.part"
+            # Per-attempt temp file: the pid+uuid suffix keeps concurrent
+            # processes and orphaned workers from ever sharing a path.
+            tmp_path = (
+                f"{output_path}.{os.getpid()}-{uuid.uuid4().hex[:12]}.part"
+            )
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(
@@ -268,12 +357,9 @@ class CapCutTTS(TTSBase):
             finally:
                 # On success ``os.replace`` already moved the temp file; on
                 # failure remove the partial so it cannot be mistaken for real
-                # output (and so retries do not accumulate ``.part`` litter).
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:  # noqa: BLE001 - cleanup is best effort
-                        pass
+                # output.  Sweeping all sibling ``.part`` files also clears
+                # litter left by an orphaned worker from a timed-out attempt.
+                self._sweep_part_files(output_path)
 
             if not self._should_retry(last_exception):
                 logging.error(
@@ -310,26 +396,80 @@ class CapCutTTS(TTSBase):
             )
             await asyncio.sleep(wait_time)
 
+    @staticmethod
+    def _sweep_part_files(output_path: str) -> None:
+        """Remove every ``<output_path>.*.part`` file, including our own temp.
+
+        Best effort by design: a worker that is still writing (for example an
+        orphan from a timed-out attempt) may hold the file open, which fails on
+        Windows.  Nothing depends on the removal succeeding.
+        """
+        pattern = f"{glob.escape(output_path)}.*.part"
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                continue
+            except OSError:  # noqa: BLE001 - cleanup is best effort
+                logging.debug("Could not remove temp file %s", path, exc_info=True)
+
     # ── Blocking work (run in a thread) ────────────────────────────────────
+
+    @staticmethod
+    def _accepts_rate(func: Any) -> bool:
+        """Return True when ``func`` accepts a ``rate`` keyword argument.
+
+        Older/newer ``capcut-tts-api`` revisions differ here: some expose
+        ``create_tts_task(..., rate=...)``, the pinned one does not.  Probing
+        the signature keeps the provider usable against either build instead of
+        raising ``TypeError: unexpected keyword argument 'rate'``.
+        """
+        try:
+            return "rate" in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _new_client(self):
+        """Return a client dedicated to a single attempt (fresh HTTP session).
+
+        Falls back to the client built by :meth:`initialize` when the SDK
+        cannot construct another one, so an unexpected constructor failure
+        degrades to the previous behaviour rather than failing the sentence.
+        """
+        try:
+            from capcut_tts_api import CapCutClient
+
+            return CapCutClient()
+        except Exception as exc:  # noqa: BLE001 - best-effort refresh
+            logging.warning(
+                "Could not create a fresh CapCut client (%s); reusing the "
+                "initialised client.",
+                exc,
+            )
+            return self._client
 
     def _generate_and_download(
         self, text: str, output_path: str, rate: str, timeout: float | None = None
     ) -> None:
         """Submit, poll, decode and download a CapCut TTS task (blocking)."""
-        client = self._client
+        # ``requests.Session`` is not safe to share between threads and
+        # ``asyncio.wait_for`` cannot stop an orphaned worker thread.  A fresh
+        # client (and therefore a fresh session) per attempt keeps a retry from
+        # interleaving requests with the orphan it is racing.
+        client = self._new_client()
 
+        create_kwargs: dict[str, Any] = {
+            "voice": self.voice,
+            "resource_id": self.resource_id,
+        }
         # 1. Submit the synthesis task.  The SDK signature is
-        # ``create_tts_task(texts, voice=..., resource_id=..., rate=...)``, so
-        # every optional argument must be passed by keyword: a positional
-        # ``rate`` would land in the ``resource_id`` slot.
-        create = self._as_dict(
-            client.create_tts_task(
-                text,
-                voice=self.voice,
-                resource_id=self.resource_id,
-                rate=rate,
-            )
-        )
+        # ``create_tts_task(texts, voice=..., resource_id=..., [rate=...])``, so
+        # every optional argument is passed by keyword: a positional ``rate``
+        # would land in the ``resource_id`` slot.  ``rate`` only exists in some
+        # SDK revisions, so it is passed when the callable accepts it.
+        if self._accepts_rate(client.create_tts_task):
+            create_kwargs["rate"] = rate
+        create = self._as_dict(client.create_tts_task(text, **create_kwargs))
         ret = create.get("ret")
         if str(ret) != "0":
             raise CapCutTaskError(
@@ -377,43 +517,47 @@ class CapCutTTS(TTSBase):
     def _download(self, url: str, output_path: str) -> None:
         """Stream ``url`` to ``output_path`` using ``requests``.
 
+        Redirects are followed manually (at most :data:`_MAX_REDIRECTS` hops)
+        so every ``Location`` can be re-validated as HTTPS before it is
+        requested; ``requests``'s own redirect handling is disabled, which
+        means a redirect cannot silently downgrade the transfer.
+
         Refuses non-HTTPS URLs, caps the transfer at
         :data:`_MAX_DOWNLOAD_BYTES`, and validates the MP3 magic bytes before
         returning so a corrupt/HTML error page is never published as audio.
         """
         import requests
 
-        if not isinstance(url, str) or not url.startswith("https://"):
-            raise ValueError(f"CapCut refused a non-HTTPS audio URL: {url!r}")
+        current = self._require_https(url)
 
-        with requests.get(url, stream=True, timeout=config.CAPCUT_TTS_TIMEOUT) as response:
-            response.raise_for_status()
-
-            headers = getattr(response, "headers", None)
-            declared = None
-            if headers is not None and hasattr(headers, "get"):
-                try:
-                    declared = int(headers.get("Content-Length"))
-                except (TypeError, ValueError):
-                    declared = None
-            if declared is not None and declared > _MAX_DOWNLOAD_BYTES:
-                raise ValueError(
-                    "CapCut audio download exceeds the "
-                    f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit."
-                )
-
-            written = 0
-            with open(output_path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if not chunk:
-                        continue
-                    written += len(chunk)
-                    if written > _MAX_DOWNLOAD_BYTES:
+        for _hop in range(_MAX_REDIRECTS + 1):
+            with requests.get(
+                current,
+                stream=True,
+                timeout=config.CAPCUT_TTS_TIMEOUT,
+                allow_redirects=False,
+            ) as response:
+                status = getattr(response, "status_code", 200)
+                if status in _REDIRECT_STATUSES:
+                    location = self._response_location(response)
+                    if not location:
                         raise ValueError(
-                            "CapCut audio download exceeded the "
-                            f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit."
+                            "CapCut audio download redirect has no Location "
+                            f"header (HTTP {status})."
                         )
-                    handle.write(chunk)
+                    # Re-validate before the next hop: an absolute or
+                    # scheme-relative Location is resolved against the current
+                    # URL, then must still be HTTPS.
+                    current = self._require_https(urljoin(current, location))
+                    continue
+
+                response.raise_for_status()
+                self._stream_to_file(response, output_path)
+                break
+        else:
+            raise ValueError(
+                f"CapCut audio download exceeded {_MAX_REDIRECTS} redirects."
+            )
 
         with open(output_path, "rb") as handle:
             head = handle.read(3)
@@ -422,6 +566,61 @@ class CapCutTTS(TTSBase):
                 "CapCut download does not look like MP3 audio "
                 f"(first bytes: {head!r})."
             )
+
+    @staticmethod
+    def _require_https(url: Any) -> str:
+        """Return ``url`` if it is an absolute HTTPS URL, else raise."""
+        if not isinstance(url, str):
+            raise ValueError(f"CapCut refused a non-string audio URL: {url!r}")
+        parts = urlsplit(url)
+        if parts.scheme != "https" or not parts.netloc:
+            raise ValueError(f"CapCut refused a non-HTTPS audio URL: {url!r}")
+        return url
+
+    @staticmethod
+    def _response_location(response: Any) -> str | None:
+        """Return the ``Location`` header of ``response`` (if usable)."""
+        headers = getattr(response, "headers", None)
+        if headers is None or not hasattr(headers, "get"):
+            return None
+        location = headers.get("Location")
+        if location is None:
+            location = headers.get("location")
+        return location or None
+
+    @staticmethod
+    def _stream_to_file(response: Any, output_path: str) -> None:
+        """Write ``response`` to ``output_path``, enforcing the size cap.
+
+        A ``Content-Length`` above the cap fails before any bytes are
+        written; the running total is checked as a backstop because a
+        chunked response advertises no length at all.
+        """
+        headers = getattr(response, "headers", None)
+        declared = None
+        if headers is not None and hasattr(headers, "get"):
+            try:
+                declared = int(headers.get("Content-Length"))
+            except (TypeError, ValueError):
+                declared = None
+        if declared is not None and declared > _MAX_DOWNLOAD_BYTES:
+            raise ValueError(
+                "CapCut audio download exceeds the "
+                f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit."
+            )
+
+        written = 0
+        with open(output_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                written += len(chunk)
+                if written > _MAX_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        "CapCut audio download exceeded the "
+                        f"{_MAX_DOWNLOAD_BYTES // (1024 * 1024)} MiB limit."
+                    )
+                handle.write(chunk)
 
     @staticmethod
     def _looks_like_mp3(head: bytes) -> bool:
@@ -574,59 +773,72 @@ class CapCutTTS(TTSBase):
     def _should_retry(exc: BaseException) -> bool:
         """Return True if ``exc`` is a transient failure worth retrying.
 
-        Retryable: ``requests`` transport errors, ``ConnectionError`` /
-        timeouts, :class:`CapCutTaskError`, HTTP 429 and 5xx.
+        Order (the first check that yields a verdict wins):
 
-        Terminal: :class:`SignError`, ``ValueError``, and the ``RuntimeError``
-        raised when a successful task yields no audio URL.
+        1. HTTP status policy (:func:`_status_is_retryable`): 408/409/429 and
+           5xx retry; every other 4xx (400/401/403/404, ...) is terminal.
+           This decides ``requests.HTTPError`` and the SDK's
+           ``CapCutAPIError`` (which carries ``status_code``).
+        2. Timeouts — ours, builtin and asyncio's alias — are retryable.
+        3. :class:`CapCutTaskError` (a task failed/cancelled) is retryable.
+        4. ``ConnectionError`` and ``requests`` transport errors retry.
+        5. An ``HTTPError`` with no usable status is terminal: there is no
+           evidence the request is worth repeating, and retrying a client
+           error burns quota.
+        6. Name-based fallback for duck-typed stand-ins, so classification
+           still works when ``requests`` cannot be imported.
+
+        :class:`SignError`/``ValueError`` (our own validation failures) and
+        the ``RuntimeError`` raised when a successful task yields no audio URL
+        are terminal.
         """
         name = type(exc).__name__
+
+        # (1) Explicit HTTP status, decided by the shared policy.  Covers
+        # ``requests.HTTPError`` and ``capcut_tts_api.CapCutAPIError``.
+        verdict = _status_is_retryable(_status_of(exc))
+        if verdict is not None:
+            return verdict
+
+        # (2) Timeouts: our ``asyncio.wait_for``, builtin float timeouts and
+        # the SDK's ``requests`` timeouts all surface here.
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+
+        # (3) A task that failed on the server is worth re-submitting.
+        if isinstance(exc, CapCutTaskError):
+            return True
+
+        # (4) Builtin connection errors.
+        if isinstance(exc, ConnectionError):
+            return True
+
+        # (5) ``requests`` transport errors.  ``HTTPError`` without a status is
+        # terminal; every other ``RequestException`` is transient.
+        try:
+            import requests
+
+            if isinstance(exc, requests.exceptions.HTTPError):
+                return False
+            if isinstance(exc, requests.exceptions.RequestException):
+                return True
+        except ImportError:  # pragma: no cover - requests is a hard test dep
+            pass
+
+        # (6a) Name fallback for duck-typed transport errors.
+        if name in _RETRYABLE_EXC_NAMES:
+            return True
+        # (6b) Terminal SDK/validation errors.  Checked after the status
+        # policy so a status-carrying error is always classified by HTTP code
+        # first; a bare ``SignError`` or bad argument still never retries.
         if name in _TERMINAL_EXC_NAMES:
             return False
-
-        # Our own sign/validation errors are terminal.  (``CapCutTaskError``
-        # inherits from ``Exception``, not ``ValueError``, so a plain
-        # ``isinstance(exc, ValueError)`` check already excludes it.)
         if isinstance(exc, SignError):
             return False
         if isinstance(exc, ValueError):
             return False
-
-        # Timeouts (ours, builtin, or asyncio's alias) are retryable.
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
-            return True
-
-        # A task that failed on the server is worth re-submitting.
-        if isinstance(exc, CapCutTaskError):
-            return True
-
-        # Builtin connection errors.
-        if isinstance(exc, ConnectionError):
-            return True
-
-        # requests transport errors (import is optional/offline-safe).
-        try:
-            import requests
-
-            if isinstance(exc, requests.exceptions.RequestException):
-                return True
-        except ImportError:
-            pass
-
-        # Name-based fallback for duck-typed transport errors.
-        if name in _RETRYABLE_EXC_NAMES:
-            return True
-
-        # Any carried HTTP status code: 429 and 5xx retry, other 4xx terminal.
-        status = getattr(exc, "status_code", None)
-        if not isinstance(status, int) or isinstance(status, bool):
-            response = getattr(exc, "response", None)
-            status = getattr(response, "status_code", None)
-        if isinstance(status, int) and not isinstance(status, bool):
-            if status == 429 or 500 <= status < 600:
-                return True
-            if 400 <= status < 500:
-                return False
+        if name == "HTTPError":
+            return False
 
         # "No URL" RuntimeError and everything else is terminal.
         return False
