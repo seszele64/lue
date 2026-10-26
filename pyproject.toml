@@ -52,6 +52,27 @@ speechify = [
 free = [
     "gTTS>=2.5.0",
 ]
+capcut = [
+    # Pinned to an immutable commit SHA (upstream publishes no tags; branch
+    # heads are moving targets). Refresh deliberately, then update this SHA and
+    # the install note in VOICES.md:
+    #   git ls-remote https://github.com/K07VN/capcut-tts-api main
+    # PEP 508 / PyPI decision: this extra is deliberately source-only and is
+    # *not* shipped to PyPI. PyPI rejects published metadata containing direct
+    # URL (git+) requirements, so publishing must either (a) strip this extra
+    # before building -- remove the `capcut` key from
+    # [project.optional-dependencies] in the release tree, then
+    # `python -m build` (there is no `--without` flag) -- or (b) keep git-only
+    # distribution and tell users to install from source:
+    # `pip install "capcut-tts-api @ git+...@<sha>"` then `pip install .`.
+    # Never upload a wheel/sdist whose metadata still carries this
+    # requirement -- the upload will be rejected.
+    # The extra only resolves from a source checkout with pip/uv; tools
+    # without git+ support fail or skip it.  The provider is optional either
+    # way, so nothing else depends on it.
+    "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07",
+    "requests>=2.25.0",
+]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.25.0",
