@@ -11,10 +11,22 @@ _overlap_warned = False
 def warn_overlap_deprecated() -> None:
     """Log a single deprecation warning for the removed overlap feature (spec-v3 §9.1).
 
-    Crossfade/overlap was replaced by the gapless persistent sink.  This is
-    emitted at most once per process, either from
-    :meth:`TTSBase.get_overlap_seconds` or from startup when a legacy
-    ``TTS_OVERLAP_SECONDS`` mapping is non-empty.
+    Crossfade/overlap was replaced by the gapless persistent sink; per-provider
+    overrides from ``TTS_OVERLAP_SECONDS`` are no longer honoured and providers
+    return ``None`` from :meth:`TTSBase.get_overlap_seconds`.  The warning is
+    emitted *lazily*, the first time that accessor is called (typically from
+    ``audio.py`` while scheduling a sentence), so a legacy
+    ``TTS_OVERLAP_SECONDS`` mapping alone does not produce a startup warning.
+
+    Playback behaviour therefore *does* change for providers that used to have
+    an override, and ``TTS_OVERLAP_SECONDS`` is now dead configuration.  The
+    legacy per-file path keeps applying ``config.OVERLAP_SECONDS`` (default
+    ``0.0`` in this branch, overridable with ``--over``), scaled down as the
+    playback speed approaches ``3.0x``; a provider that previously lowered or
+    raised the overlap through ``TTS_OVERLAP_SECONDS`` silently falls through to
+    that global default.  Concretely, Kokoro's ``0.6`` entry no longer applies —
+    a small, accepted regression until gapless playback (spec-v3, see the
+    gapless-persistent-sink PR) takes over overlap scheduling entirely.
     """
     global _overlap_warned
     if _overlap_warned:
@@ -22,8 +34,9 @@ def warn_overlap_deprecated() -> None:
     _overlap_warned = True
     logging.getLogger(__name__).warning(
         "Per-sentence audio overlap/crossfade has been removed (gapless persistent "
-        "sink); get_overlap_seconds() now returns None and any configured overlap "
-        "value is ignored."
+        "sink); get_overlap_seconds() now returns None, so TTS_OVERLAP_SECONDS "
+        "entries are ignored. The legacy per-file playback path still uses "
+        "config.OVERLAP_SECONDS (see --over)."
     )
 
 
@@ -203,8 +216,11 @@ class TTSBase(ABC):
         Deprecated: per-sentence crossfade/overlap was removed (spec-v3 §9.1).
 
         The gapless persistent sink concatenates decoded PCM, so no overlap is
-        applied.  This method is kept only for backward compatibility with the
-        legacy per-file audio path and always returns ``None``.
+        applied.  Provider-specific ``TTS_OVERLAP_SECONDS`` overrides are no
+        longer honoured either.  This method is kept only for backward
+        compatibility with the legacy per-file audio path and always returns
+        ``None``; that path then keeps using ``config.OVERLAP_SECONDS`` between
+        sentences.
         """
         warn_overlap_deprecated()
         return None

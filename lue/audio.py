@@ -21,6 +21,7 @@ import shutil
 import logging
 
 from . import config, content_parser, audio_sink
+from .tts_pipeline import create_pipeline
 
 # This pattern is used to both clean text for TTS and detect sentence fragments.
 ABBREVIATION_PATTERN = r'\b(Mr|Mrs|Ms|Dr|Prof|Rev|Hon|Jr|Sr|Cpl|Sgt|Gen|Col|Capt|Lt|Pvt|vs|viz|Co|Inc|Ltd|Corp|St|Ave|Blvd)\.'
@@ -189,6 +190,44 @@ async def stop_and_clear_audio(reader):
             pass
     reader.playback_processes = []
 
+    # Legacy TTS pipeline teardown (buffer → parallel, cleans temp files).
+    # The branch sink path has already been stopped in steps 5-6 above.
+    pipeline = getattr(reader, 'pipeline', None)
+    if pipeline is not None:
+        try:
+            await pipeline.stop()
+        except Exception:  # noqa: BLE001 - teardown must never raise
+            pass
+        try:
+            reader._pipeline_state = pipeline.state.name
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Give the legacy per-file players a moment to release their buffers.
+    await asyncio.sleep(0.1)
+
+    # Legacy per-file buffer cleanup with retries for slow filesystems.
+    for buf_base in config.AUDIO_BUFFERS:
+        for ext in ['.mp3', '.wav']:
+            buf = f"{buf_base}{ext}"
+            for attempt in range(5):
+                try:
+                    if os.path.exists(buf):
+                        os.remove(buf)
+                    break
+                except OSError:
+                    if attempt < 4:
+                        await asyncio.sleep(0.1)
+
+    # Clean up any remaining lookahead temp files.
+    import glob
+    for la_file in glob.glob(os.path.join(config.LOOKAHEAD_TEMP_DIR, "la_*")):
+        try:
+            if os.path.isfile(la_file):
+                os.remove(la_file)
+        except OSError:
+            pass
+
     for task in list(getattr(reader, 'active_playback_tasks', None) or []):
         await _cancel_task(task)
     reader.active_playback_tasks = []
@@ -302,13 +341,49 @@ async def _start_persistent(reader):
 
 
 async def _start_legacy(reader):
-    """Legacy per-file pipeline (``--legacy-audio``)."""
-    await _cancel_task(reader.producer_task)
-    await _cancel_task(reader.player_task)
+    """Deploy's lookahead/cache/parallel pipeline (``--legacy-audio`` fallback).
+
+    ``create_pipeline`` builds TTSCache → ParallelTTSGen → LookaheadBuffer and
+    starts its producer; :func:`_player_loop` below consumes the buffered files
+    with per-sentence pacing and the legacy overlap calculation.
+    """
+    for task in (reader.producer_task, reader.player_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
     reader.producer_task = None
     reader.player_task = None
     await asyncio.sleep(0.05)
-    reader.producer_task = asyncio.create_task(_producer_loop(reader))
+
+    reader.pipeline = create_pipeline(reader)
+    reader.tts_cache = reader.pipeline.cache
+    reader.lookahead_buffer = reader.pipeline.buffer
+    reader.producer_task = reader.pipeline.start()
+    reader._pipeline_state = reader.pipeline.state.name
+
+    # Wait for pre-buffer threshold before starting the player.
+    # Two thresholds: minimum item count OR minimum seconds of audio,
+    # whichever is reached first (plus a 30-second safety timeout).
+    import time as _time
+    _buffer_start = _time.monotonic()
+    _total_duration_buffered = 0.0
+    while (reader.running
+           and reader.lookahead_buffer.qsize < config.PREBUFFER_MIN_ITEMS
+           and _total_duration_buffered < config.PREBUFFER_MIN_SECONDS
+           and reader.lookahead_buffer._is_running
+           and not reader.producer_task.done()):
+        _total_duration_buffered = getattr(
+            reader.lookahead_buffer, '_buffered_duration', 0.0
+        )
+        if _time.monotonic() - _buffer_start > 30.0:
+            break
+        await asyncio.sleep(0.05)
+
+    # Start player regardless of whether the threshold was reached
+    # (producer may have finished early or the reader may have been stopped).
     reader.player_task = asyncio.create_task(_player_loop(reader))
 
 
@@ -575,13 +650,38 @@ async def _producer_loop(reader):
 
 
 async def _player_loop(reader):
-    """Legacy player loop to play audio files."""
+    """Legacy player loop: play audio files from the lookahead buffer."""
+    buf = getattr(reader, 'lookahead_buffer', None)
+    use_buffer = buf is not None
+
+    def mark_done():
+        """Call task_done on the appropriate queue."""
+        if use_buffer:
+            buf.task_done()
+        else:
+            try:
+                reader.audio_queue.task_done()
+            except ValueError:
+                pass  # too many task_done calls
+
+    async def signal_refill():
+        """Signal the lookahead buffer producer to refill."""
+        if use_buffer:
+            try:
+                await buf.signal_refill()
+            except Exception:
+                pass
+
     try:
         while reader.running:
             try:
-                item = await asyncio.wait_for(reader.audio_queue.get(), timeout=1.0)
+                if use_buffer:
+                    item = await buf.get()
+                else:
+                    item = await asyncio.wait_for(reader.audio_queue.get(), timeout=1.0)
+
                 if item is None:
-                    reader.audio_queue.task_done()
+                    mark_done()
                     if reader.active_playback_tasks:
                         await asyncio.gather(*reader.active_playback_tasks, return_exceptions=True)
                     reader.playback_finished_event.set()
@@ -596,7 +696,12 @@ async def _player_loop(reader):
                 word_timings = timing_info.get("word_timings", [])
 
                 if not os.path.exists(audio_file):
-                    reader.audio_queue.task_done()
+                    mark_done()
+                    await signal_refill()
+                    continue
+                if duration is None or duration <= 0:
+                    mark_done()
+                    await signal_refill()
                     continue
                 try:
                     reader.loop.call_soon_threadsafe(
@@ -604,7 +709,7 @@ async def _player_loop(reader):
                         ('_new_sentence_started', (c, p, s, duration, timing_data))
                     )
                 except RuntimeError:
-                    reader.audio_queue.task_done()
+                    mark_done()
                     break
                 try:
                     cmd = ['ffplay', '-nodisp', '-autoexit', '-loglevel', 'error']
@@ -630,7 +735,8 @@ async def _player_loop(reader):
                     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                     reader.playback_processes.append(process)
                 except Exception:
-                    reader.audio_queue.task_done()
+                    mark_done()
+                    await signal_refill()
                     continue
 
                 async def await_and_remove(proc, file):
@@ -653,10 +759,29 @@ async def _player_loop(reader):
 
                 playback_task = asyncio.create_task(await_and_remove(process, audio_file))
                 reader.active_playback_tasks.append(playback_task)
+                # Dynamic overlap based on playback speed.  ``get_overlap_seconds()``
+                # now returns None (gapless does not use it), so this falls back to
+                # ``config.OVERLAP_SECONDS`` (0.0 in this branch).
+                base_overlap = config.OVERLAP_SECONDS
+                if reader.tts_model and hasattr(reader.tts_model, 'get_overlap_seconds'):
+                    tts_overlap = reader.tts_model.get_overlap_seconds()
+                    if tts_overlap is not None:
+                        base_overlap = tts_overlap
 
-                # Overlap/crossfade was removed (spec-v3 §9.1): no per-sentence
-                # sleep and no overlap; TTS overlap accessors return ``None``.
-                reader.audio_queue.task_done()
+                # Apply speed-based overlap reduction
+                speed = reader.playback_speed
+                if speed >= 3.0:
+                    overlap_seconds = 0.0
+                else:
+                    overlap_factor = max(0.0, min(1.0, (3.0 - speed) / (3.0 - 1.0)))
+                    overlap_seconds = base_overlap * overlap_factor
+
+                # Adjust duration for playback speed
+                actual_duration = duration / speed
+
+                await asyncio.sleep(max(0.1, actual_duration - overlap_seconds))
+                mark_done()
+                await signal_refill()
             except asyncio.TimeoutError:
                 if not reader.running: break
                 continue
