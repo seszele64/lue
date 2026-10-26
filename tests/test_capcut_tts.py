@@ -9,8 +9,10 @@ network.
 from __future__ import annotations
 
 import json
+import os
 import random
 import sys
+import time
 import types
 from unittest.mock import Mock
 
@@ -20,6 +22,7 @@ from lue.tts.capcut_tts import (
     CapCutTaskError,
     CapCutTTS,
     SignError,
+    _PART_SWEEP_STALE_AGE,
 )
 from lue.tts_manager import TTSManager
 
@@ -580,13 +583,13 @@ async def test_download_redirect_chain_is_bounded(monkeypatch, mock_console, tmp
 
 @pytest.mark.asyncio
 async def test_stale_part_files_are_swept(monkeypatch, mock_console, tmp_output_dir):
-    """Orphans from a timed-out attempt must not survive a later success."""
+    """Orphans from a timed-out attempt in this process must not survive."""
     client = FakeCapCutClient()
     install_fake_sdk(monkeypatch, client)
     install_fake_requests(monkeypatch, payload=b"ID3SWEEP")
 
     out = tmp_output_dir / "out.mp3"
-    orphan = tmp_output_dir / f"{out.name}.4242-deadbeef.part"
+    orphan = tmp_output_dir / f"{out.name}.{os.getpid()}-deadbeef.part"
     orphan.write_bytes(b"junk from an orphaned worker")
 
     instance = CapCutTTS(mock_console)
@@ -597,6 +600,53 @@ async def test_stale_part_files_are_swept(monkeypatch, mock_console, tmp_output_
     assert out.read_bytes() == b"ID3SWEEP"
     assert not orphan.exists()
     assert not list(tmp_output_dir.glob("*.part"))
+
+
+@pytest.mark.asyncio
+async def test_sweep_leaves_foreign_pid_temp_files_alone(
+    monkeypatch, mock_console, tmp_output_dir
+):
+    """Another live instance's temp file must never be deleted by our sweep."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch, payload=b"ID3SCOPE")
+
+    out = tmp_output_dir / "out.mp3"
+    # A different pid, written just now: it may belong to a running instance.
+    foreign = tmp_output_dir / f"{out.name}.4242-deadbeef.part"
+    foreign.write_bytes(b"another instance is still writing this")
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    await instance.generate_audio("Hi.", str(out))
+
+    assert out.read_bytes() == b"ID3SCOPE"
+    assert foreign.exists()
+
+
+@pytest.mark.asyncio
+async def test_sweep_removes_stale_foreign_pid_temp_files(
+    monkeypatch, mock_console, tmp_output_dir
+):
+    """Old temp files from a dead process are litter and should be swept."""
+    client = FakeCapCutClient()
+    install_fake_sdk(monkeypatch, client)
+    install_fake_requests(monkeypatch, payload=b"ID3STALE")
+
+    out = tmp_output_dir / "out.mp3"
+    stale = tmp_output_dir / f"{out.name}.4242-deadbeef.part"
+    stale.write_bytes(b"litter from a crashed run")
+    old = time.time() - (_PART_SWEEP_STALE_AGE + 60)
+    os.utime(stale, (old, old))
+
+    instance = CapCutTTS(mock_console)
+    assert await instance.initialize() is True
+
+    await instance.generate_audio("Hi.", str(out))
+
+    assert out.read_bytes() == b"ID3STALE"
+    assert not stale.exists()
 
 
 class TestSdkParsers:

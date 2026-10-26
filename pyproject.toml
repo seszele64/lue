@@ -57,9 +57,13 @@ capcut = [
     # heads are moving targets). Refresh deliberately, then update this SHA and
     # the install note in VOICES.md:
     #   git ls-remote https://github.com/K07VN/capcut-tts-api main
-    # PEP 508 note: PyPI has no capcut-tts-api release, so this extra only
-    # resolves with pip/VCS support (pip, uv). Tools without git+ support will
-    # skip/fail this extra; the provider is optional either way.
+    # PEP 508 / PyPI note: PyPI has no capcut-tts-api release, so this extra is
+    # git-only and is *not* part of any PyPI release -- PyPI rejects published
+    # metadata that contains direct URL (git+) requirements, so the package
+    # must be uploaded without this extra (see VOICES.md, "CapCut TTS").
+    # The extra only resolves from a source checkout with pip/uv; tools
+    # without git+ support fail or skip it.  The provider is optional either
+    # way, so nothing else depends on it.
     "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07",
     "requests>=2.25.0",
 ]

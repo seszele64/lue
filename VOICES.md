@@ -724,9 +724,17 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 
 #### Setup
 
-1. Install the extra (the SDK is a git dependency, not on PyPI):
+1. Install the extra (the SDK is a git dependency, not on PyPI, and the extra
+   only resolves from a source checkout — see the note below):
    `pip install 'lue-reader[capcut]'`
 2. Use it: `lue book.epub --tts capcut`
+
+> **PyPI note.** The `capcut` extra contains a PEP 508 direct URL
+> (`capcut-tts-api @ git+…`). PyPI rejects published metadata with direct URL
+> requirements, so this extra exists only in the source tree and is **not
+> available from a PyPI install**. From a source checkout, either use the extra
+> as shown above, or install the pinned SDK manually and then Lue:
+> `pip install "capcut-tts-api @ git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07"`
 
 The provider produces MP3 audio and does **not** expose word-level timing, so Lue uses sentence-level highlighting for it.
 
@@ -746,9 +754,15 @@ CapCut voices are numeric resource IDs exposed by the SDK's catalogue (`data/Voi
 | `LUE_CAPCUT_TTS_TIMEOUT` | `120` | Per-request wall-clock timeout in seconds (30s floor). Covers submit + poll + download. |
 | `LUE_CAPCUT_TTS_MAX_RETRIES` | `2` | Retry attempts for transient failures (0-10). |
 | `LUE_CAPCUT_TTS_RETRY_BASE_DELAY` | `2.0` | Base delay in seconds for exponential backoff (0.5s floor). |
-| `LUE_CAPCUT_TTS_RATE` | `1.0` | Speaking rate, clamped to the accepted range **0.5-2.0**. |
+| `LUE_CAPCUT_TTS_RATE` | `1.0` | Speaking rate, clamped to the accepted range **0.5-2.0**. **Ignored by the pinned SDK (v1.5.0)**, which has no `rate` parameter; Lue warns at startup when a non-default value is set. Takes effect once the SDK adds rate support. |
 | `LUE_CAPCUT_RESOURCE_ID` | *unset* | Optional resource/voice-catalogue override forwarded to `create_tts_task`. |
 | `LUE_CAPCUT_TTS_WARMUP` | `false` | Set to `true`/`1` to synthesize a throwaway sentence on startup. |
+
+> **Speaking rate is currently a no-op.** The pinned `capcut-tts-api` revision
+> (v1.5.0) does not expose a `rate` argument on `create_tts_task`. Lue accepts
+> `LUE_CAPCUT_TTS_RATE` and clamps it, but the value is dropped by the SDK; a
+> warning is printed at startup when it differs from the default. The setting
+> will take effect as soon as the SDK supports rate control.
 
 #### Limitations
 

@@ -95,6 +95,12 @@ _URL_KEYS = (
     "url",
 )
 
+#: Age (seconds) after which a ``.part`` temp file owned by *another* pid is
+#: considered orphaned litter.  Our own files are swept immediately; another
+#: process may legitimately still be writing to its own temp file, so it is
+#: left alone until it is unambiguously stale.
+_PART_SWEEP_STALE_AGE = 300.0
+
 #: ``__cause__``-free, name-based retry hints (duck-typed SDK stand-ins).
 #: ``HTTPError`` is deliberately absent: it is classified explicitly via its
 #: HTTP status, so a status-less one is treated as terminal.
@@ -218,7 +224,8 @@ class CapCutTTS(TTSBase):
             )
             self.console.print(
                 '[yellow]Install it with: pip install "capcut-tts-api @ '
-                'git+https://github.com/K07VN/capcut-tts-api"[/yellow]'
+                "git+https://github.com/K07VN/capcut-tts-api@"
+                '7ab87fbd12cbafa60bea4a48903eddf42a939b07"[/yellow]'
             )
             logging.error("'capcut-tts-api' is not installed.")
             return False
@@ -357,8 +364,9 @@ class CapCutTTS(TTSBase):
             finally:
                 # On success ``os.replace`` already moved the temp file; on
                 # failure remove the partial so it cannot be mistaken for real
-                # output.  Sweeping all sibling ``.part`` files also clears
-                # litter left by an orphaned worker from a timed-out attempt.
+                # output.  Sweeping this output's ``.part`` files also clears
+                # litter from an orphaned worker of a timed-out attempt, while
+                # leaving another process's live temp file untouched.
                 self._sweep_part_files(output_path)
 
             if not self._should_retry(last_exception):
@@ -398,14 +406,30 @@ class CapCutTTS(TTSBase):
 
     @staticmethod
     def _sweep_part_files(output_path: str) -> None:
-        """Remove every ``<output_path>.*.part`` file, including our own temp.
+        """Remove ``<output_path>.*.part`` files this process may own.
 
-        Best effort by design: a worker that is still writing (for example an
-        orphan from a timed-out attempt) may hold the file open, which fails on
-        Windows.  Nothing depends on the removal succeeding.
+        Temp names are ``<output>.<pid>-<uuid12>.part``, so ownership is read
+        from the name.  Files carrying our pid are removed unconditionally:
+        they belong to an attempt of this process (possibly an orphaned worker
+        thread from a timed-out attempt) and can no longer be published.
+        Files carrying another pid are only removed once they are older than
+        :data:`_PART_SWEEP_STALE_AGE`; a live sibling instance may still be
+        writing its own temp file, and deleting that would corrupt its output.
+
+        Best effort by design: a worker that is still writing may hold the file
+        open, which fails on Windows.  Nothing depends on the removal
+        succeeding.
         """
         pattern = f"{glob.escape(output_path)}.*.part"
+        own_prefix = f"{output_path}.{os.getpid()}-"
+        now = time.time()
         for path in glob.glob(pattern):
+            if not path.startswith(own_prefix):
+                try:
+                    if now - os.path.getmtime(path) < _PART_SWEEP_STALE_AGE:
+                        continue
+                except OSError:  # noqa: BLE001 - vanished/unreadable: skip
+                    continue
             try:
                 os.remove(path)
             except FileNotFoundError:
