@@ -79,5 +79,5 @@ The project SHALL include OpenAI as an optional dependency that users can instal
 
 #### Scenario: Install OpenAI Extra
 - Given: A user wants to use OpenAI TTS
-- When: They run `pip install lue[openai]`
+- When: They run `pip install 'lue-reader[openai]'`
 - Then: The `openai>=1.0.0` package is installed

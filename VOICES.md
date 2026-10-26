@@ -1,6 +1,6 @@
 # Lue - Voices and Languages Guide
 
-This document explains the speakers and languages included in the Edge, Kokoro, OpenAI, and CapCut TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI TTS requires an API key; CapCut TTS is an optional, unofficial integration that also needs no key.
+This document explains the speakers and languages included in the Edge, Kokoro, OpenAI, NanoGPT, Speechify, gTTS, and CapCut TTS models. Edge and Kokoro are part of Lue’s default installation; OpenAI, NanoGPT, and Speechify require an API key; gTTS is free (no key) but relies on an unofficial/rate-limited service; CapCut TTS is an optional, unofficial integration that also needs no key.
 
 ***
 
@@ -14,12 +14,16 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
     "openai": "alloy",            # Default OpenAI voice
+    "nanogpt": "Rex",             # Default NanoGPT voice
+    "speechify": "wren",          # Default Speechify voice
+    "gtts": "en",                 # Default gTTS language code (or set LUE_GTTS_LANG)
     "capcut": "BV074_streaming",  # Default CapCut streaming voice
 }
 
 # Language settings for TTS models
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # Language code for Kokoro TTS
+    "gtts": "en",   # Fallback for TTS_VOICES["gtts"]
 }
 ```
 
@@ -671,7 +675,7 @@ OpenAI TTS uses cloud-based voices powered by OpenAI's Speech API. It requires a
 #### Setup
 
 1. Set your API key: `export OPENAI_API_KEY='your-key'`
-2. Install the package: `pip install lue[openai]`
+2. Install the package: `pip install 'lue-reader[openai]'`
 3. Use with: `lue book.epub --tts openai`
 
 #### Available Voices
@@ -709,6 +713,7 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 - **Internet required**: Audio generation requires an active internet connection.
 - **Rate limits**: OpenAI API has rate limits. Very large books may need to be read in sessions.
 - **4096 character limit**: Each request is limited to 4096 characters. Lue automatically splits text by sentence, so this is handled transparently.
+
 ***
 
 ### CapCut TTS
@@ -751,4 +756,192 @@ CapCut voices are numeric resource IDs exposed by the SDK's catalogue (`data/Voi
 - **Unofficial API**: reverse-engineered and subject to change without notice; not affiliated with CapCut/ByteDance.
 - **Device spoofing & ToS**: the SDK impersonates the CapCut desktop client; use may breach CapCut's terms and consume account credits.
 - **Rate limits / credits**: CapCut may throttle requests or exhaust free credits; avoid large batches in quick succession.
-- **Git-only dependency**: installs from GitHub, so it requires network access at install time; pinning to a commit is recommended for reproducibility.
+- **Git-only dependency**: installs from GitHub, so it requires network access at install time. The `capcut` extra pins an immutable commit SHA for reproducibility; if you install manually, replicate the pin: `pip install 'git+https://github.com/K07VN/capcut-tts-api@7ab87fbd12cbafa60bea4a48903eddf42a939b07'`. PyPI has no `capcut-tts-api` release, so only installers that understand PEP 508 `git+` URLs (pip, uv) can resolve this extra.
+
+***
+
+### gTTS (Google Translate TTS)
+
+`gTTS` wraps Google Translate's free text-to-speech endpoint. It needs **no API key**, only an internet connection.
+
+#### Setup
+
+1. Install the extra: `pip install 'lue-reader[free]'`
+2. Use with: `lue book.epub --tts gtts`
+
+#### Languages
+
+gTTS is selected by a language code rather than a named voice. The value is resolved in this order — the first non-empty one wins:
+
+1. `--lang` (or `--voice`, which gTTS also treats as a language code)
+2. `LUE_GTTS_LANG` environment variable
+3. `TTS_VOICES["gtts"]` in `lue/config.py` (default: `en`) — the usual knob to change
+4. `TTS_LANGUAGE_CODES["gtts"]` in `lue/config.py` (fallback alias, default: `en`)
+
+Common codes: `en`, `fr`, `de`, `es`, `it`, `ja`, `zh-CN`. Deprecated regional tags such as `en-uk` are still accepted and fall back to `en`; for a British accent prefer `en` together with `LUE_GTTS_TLD=co.uk`.
+
+```bash
+# Per-run override
+lue book.epub --tts gtts --lang fr
+
+# New default for every run
+LUE_GTTS_LANG=de lue book.epub --tts gtts
+```
+
+Or edit the config default:
+
+```python
+# lue/config.py
+TTS_VOICES = {
+    ...
+    "gtts": "ja",  # Default gTTS language code
+}
+```
+
+An unsupported or malformed code is reported during startup and disables TTS for the session, rather than failing on every sentence.
+
+Optional environment variables:
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). Validated at startup: a value that does not look like `com`/`co.uk`/`de` disables gTTS for the session instead of failing on every sentence. |
+| `LUE_GTTS_SLOW` | `false` | Set to `true`/`1` for slower speech. |
+| `LUE_GTTS_LANG` | `en` | Default language code; overrides `TTS_VOICES["gtts"]`. |
+| `LUE_GTTS_TIMEOUT` | `30` | Timeout in seconds for each 100-character chunk request (floored at `5`). The overall budget for a sentence is `chunks × this value + 10s`, so long sentences are not aborted while later chunks are still in flight. A sentence that exceeds its budget is retried by the audio pipeline. |
+
+#### Limitations
+
+- **No word-level timing**: sentence-level highlighting is used.
+- **Rate limits**: Google may throttle or temporarily block frequent requests. Avoid very large batches in quick succession.
+- **Unofficial endpoint**: relies on Google Translate's public TTS, which may change without notice.
+
+***
+
+### NanoGPT TTS (SpaceXAI `xai-tts`)
+
+NanoGPT TTS uses the NanoGPT gateway (`https://nano-gpt.com/api/tts`) to reach the Runware-hosted SpaceXAI text-to-speech model. It requires a NanoGPT API key and an internet connection. The provider does not expose word-level timing metadata, so the reader falls back to sentence-level highlighting.
+
+#### Setup
+
+1. Set your API key: `export NANOGPT_API_KEY='your-key'`
+2. Install the dependency: `pip install lue[nanogpt]` (or `pip install httpx`)
+3. Use with: `lue book.epub --tts nanogpt`
+
+#### Available Voices
+
+| Voice | Notes |
+| :--- | :--- |
+| **Rex** | Default voice |
+| Eve | Alternative voice |
+| Ara | Alternative voice |
+| Leo | Alternative voice |
+| Sal | Alternative voice |
+
+Select a voice with `--voice`, e.g. `lue book.epub --tts nanogpt --voice Eve`.
+
+#### Models
+
+| Model | Notes |
+| :--- | :--- |
+| xai-tts | SpaceXAI TTS (default). Multilingual auto-detection, inline expressive controls. Set `NANOGPT_TTS_MODEL` to override. |
+
+#### Configuration
+
+| Environment variable | Default | Description |
+| :--- | :--- | :--- |
+| `NANOGPT_API_KEY` | *(required)* | NanoGPT API key |
+| `NANOGPT_TTS_MODEL` | `xai-tts` | TTS model ID |
+| `NANOGPT_BASE_URL` | `https://nano-gpt.com/api` | API base URL |
+| `LUE_NANOGPT_TTS_SPEED` | `1` | Synthesis speed (clamped to 0.7–1.5) |
+| `LUE_NANOGPT_TTS_TIMEOUT` | `30` | Per-request timeout (seconds) |
+| `LUE_NANOGPT_TTS_MAX_RETRIES` | `3` | Max retries for transient failures |
+
+#### Pricing
+
+- **xai-tts**: $0.0165 per 1000 characters ($16.50 per 1 million characters)
+
+For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs approximately $0.495.
+
+#### Limitations
+
+- **No word-level timing**: The reader automatically switches to sentence-level highlighting.
+- **Internet required**: Audio generation requires an active internet connection.
+- **5000 character limit**: Each request is limited to 5000 characters. Lue automatically chunks longer text at sentence boundaries and concatenates the audio, so this is handled transparently.
+- **Usage costs**: Every uncached sentence is a billed API call. The TTS cache avoids re-generating already-heard sentences.
+
+***
+
+### Speechify TTS (Simba `simba-3.2`)
+
+Speechify TTS talks to the Speechify Build API (`https://api.speechify.ai/v1/audio/speech`) to synthesize speech with the Simba model family. It requires a Speechify API key and an internet connection. Unlike the other cloud providers, Speechify returns **word-level speech marks with every response**, so the reader keeps word-level highlighting.
+
+#### Setup
+
+1. Set your API key: `export SPEECHIFY_API_KEY='your-key'`
+2. Install the dependency: `pip install lue[speechify]` (or `pip install httpx`)
+3. Use with: `lue book.epub --tts speechify`
+
+#### Available Voices
+
+| Voice | Notes |
+| :--- | :--- |
+| **wren** | Default voice |
+| george | Alternative voice |
+| henry | Alternative voice |
+| carly | Alternative voice |
+| sabrina | Alternative voice |
+
+Select a voice with `--voice`, e.g. `lue book.epub --tts speechify --voice george`. Call `GET /v1/voices` with your key to list every voice your workspace can use.
+
+#### Models
+
+| Model | Notes |
+| :--- | :--- |
+| **simba-3.2** | Default. Recommended English model, lowest TTFB and richest expressivity. Curated voice set only. |
+| simba-3.0 | Streaming multilingual (English + 6 European locales). Set `LUE_SPEECHIFY_TTS_MODEL` to override. |
+
+`simba-3.2` is English-only: a non-English voice returns HTTP 400. Use `simba-3.0` for other languages.
+
+#### Configuration
+
+| Environment variable | Default | Description |
+| :--- | :--- | :--- |
+| `SPEECHIFY_API_KEY` | *(required)* | Speechify API key |
+| `LUE_SPEECHIFY_TTS_MODEL` | `simba-3.2` | TTS model ID |
+| `SPEECHIFY_BASE_URL` | `https://api.speechify.ai` | API base URL |
+| `LUE_SPEECHIFY_TTS_MAX_CONCURRENT` | `1` | Max simultaneous requests (see limits below) |
+| `LUE_SPEECHIFY_TTS_TEXT_NORMALIZATION` | `False` | Expand numbers/abbreviations before synthesis |
+| `LUE_SPEECHIFY_TTS_TIMEOUT` | `30` | Per-request timeout (seconds) |
+| `LUE_SPEECHIFY_TTS_MAX_RETRIES` | `3` | Max retries for transient failures |
+| `LUE_SPEECHIFY_TTS_RETRY_BASE_DELAY` | `1.0` | Base backoff delay (seconds); `Retry-After` is honoured |
+
+#### Pricing
+
+Billed per character (whitespace and SSML tags are not counted):
+
+| Plan | Rate |
+| :--- | :--- |
+| Free | 500,000 characters free each month |
+| Starter | $10 per 1M characters |
+| Pro | $8 per 1M characters |
+| Scale | $6 per 1M characters |
+
+For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs approximately **$0.30** on Starter. Sentences already in the TTS cache are free.
+
+#### Limits
+
+| Plan | Requests/second | Simultaneous requests |
+| :--- | :--- | :--- |
+| Free | 1 (burst 10) | 1 |
+| Starter | 20 (burst 60) | 15 |
+| Pro | 40 (burst 120) | 30 |
+
+Lue serialises its own requests through a semaphore defaulting to **1**, so the free plan works without hitting `concurrency_limit_reached`. Raise `LUE_SPEECHIFY_TTS_MAX_CONCURRENT` if you are on a paid plan.
+
+#### Limitations
+
+- **Internet required**: Audio generation requires an active internet connection.
+- **2000 character limit**: Each request to `/v1/audio/speech` is limited to 2000 characters. Lue automatically chunks longer text at sentence boundaries, concatenates the audio, and offsets the word timings so highlighting stays aligned.
+- **English by default**: `simba-3.2` is English-only. Switch `LUE_SPEECHIFY_TTS_MODEL=simba-3.0` for German, Spanish, French, Italian or Brazilian Portuguese.
+- **Rate limits**: The free plan allows 1 request/second and 1 simultaneous request. Rate-limit (`429`) responses are retried with exponential backoff, honouring `Retry-After`.
+- **Usage costs**: Every uncached sentence is a billed API call. The TTS cache avoids re-generating already-heard sentences.
