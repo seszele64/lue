@@ -670,7 +670,7 @@ OpenAI TTS uses cloud-based voices powered by OpenAI's Speech API. It requires a
 #### Setup
 
 1. Set your API key: `export OPENAI_API_KEY='your-key'`
-2. Install the package: `pip install lue[openai]`
+2. Install the package: `pip install 'lue-reader[openai]'`
 3. Use with: `lue book.epub --tts openai`
 
 #### Available Voices
