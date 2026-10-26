@@ -759,10 +759,10 @@ Optional environment variables:
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). |
+| `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). Validated at startup: a value that does not look like `com`/`co.uk`/`de` disables gTTS for the session instead of failing on every sentence. |
 | `LUE_GTTS_SLOW` | `false` | Set to `true`/`1` for slower speech. |
 | `LUE_GTTS_LANG` | `en` | Default language code; overrides `TTS_VOICES["gtts"]`. |
-| `LUE_GTTS_TIMEOUT` | `30` | Per-request network timeout in seconds (floored at `5`). A timed-out sentence is retried by the audio producer. |
+| `LUE_GTTS_TIMEOUT` | `30` | Timeout in seconds for each 100-character chunk request (floored at `5`). The overall budget for a sentence is `chunks × this value + 10s`, so long sentences are not aborted while later chunks are still in flight. A sentence that exceeds its budget is retried by the audio pipeline. |
 
 #### Limitations
 

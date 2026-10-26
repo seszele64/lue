@@ -17,9 +17,16 @@ def warn_overlap_deprecated() -> None:
     ``audio.py`` while scheduling a sentence), so a legacy
     ``TTS_OVERLAP_SECONDS`` mapping alone does not produce a startup warning.
 
-    Playback behaviour is unchanged: the legacy per-file path still applies
-    ``config.OVERLAP_SECONDS`` (default ``0.5``, overridable with ``--over``)
-    between sentences, scaled down as the playback speed approaches ``3.0x``.
+    Playback behaviour therefore *does* change for providers that used to have
+    an override, and ``TTS_OVERLAP_SECONDS`` is now dead configuration.  The
+    legacy per-file path keeps applying ``config.OVERLAP_SECONDS`` (default
+    ``0.5``, overridable with ``--over``), scaled down as the playback speed
+    approaches ``3.0x``; a provider that previously lowered or raised the
+    overlap through ``TTS_OVERLAP_SECONDS`` silently falls through to that
+    global default.  Concretely, Kokoro's ``0.6`` entry no longer applies and
+    it now crossfades at ``0.5`` — a small, accepted regression until gapless
+    playback (spec-v3, see the gapless-persistent-sink PR) takes over overlap
+    scheduling entirely.
     """
     global _overlap_warned
     if _overlap_warned:
@@ -28,8 +35,8 @@ def warn_overlap_deprecated() -> None:
     logging.getLogger(__name__).warning(
         "Per-provider audio overlap/crossfade has been removed (spec-v3 §9.1); "
         "get_overlap_seconds() now returns None, so TTS_OVERLAP_SECONDS entries "
-        "are ignored. The legacy per-file playback path still uses "
-        "config.OVERLAP_SECONDS (default 0.5s, see --over)."
+        "are ignored (Kokoro's 0.6s falls through to 0.5s). The legacy per-file "
+        "playback path still uses config.OVERLAP_SECONDS (default 0.5s, see --over)."
     )
 
 

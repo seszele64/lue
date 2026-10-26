@@ -23,7 +23,11 @@ TTS_LANGUAGE_CODES = {
     "gtts": "en",  # fallback alias for TTS_VOICES["gtts"]
 }
 
-# TTS model-specific seconds of overlap between sentences (overrides default OVERLAP_SECONDS if specified)
+# TTS model-specific seconds of overlap between sentences.
+# DEPRECATED / DEAD since spec-v3 §9.1: providers return None from
+# get_overlap_seconds(), so these values are ignored.  Overlap is governed by
+# OVERLAP_SECONDS below (and, once gapless playback lands, by the gapless
+# scheduler).  Kokoro's entry is kept only so the old config shape still loads.
 TTS_OVERLAP_SECONDS = {
     "kokoro": 0.6,
 }
@@ -52,7 +56,11 @@ def _resolve_gtts_lang(env_lang: str, voices: dict, codes: dict) -> str:
 GTTS_LANG = _resolve_gtts_lang(
     os.environ.get("LUE_GTTS_LANG", ""), TTS_VOICES, TTS_LANGUAGE_CODES
 )
-GTTS_TLD = os.environ.get("LUE_GTTS_TLD", "com")
+# Endpoint top-level domain: "com" is Google's default, regional variants
+# ("co.uk", "co.in", "de") change the accent.  Normalised here, validated by
+# the provider at startup because a typo would otherwise fail on every
+# sentence (see gtts_tts.py).
+GTTS_TLD = (os.environ.get("LUE_GTTS_TLD", "com") or "").strip().lower() or "com"
 GTTS_SLOW = os.environ.get("LUE_GTTS_SLOW", "false").strip().lower() in (
     "1",
     "true",
@@ -60,9 +68,12 @@ GTTS_SLOW = os.environ.get("LUE_GTTS_SLOW", "false").strip().lower() in (
     "on",
 )
 
-# Per-request timeout (seconds) for the blocking gTTS network call.  The call
-# runs in a worker thread, so a hung request is abandoned instead of stalling
-# the audio producer; the producer's retry path then takes over.
+# Per-request timeout (seconds) for the blocking gTTS network call.  gTTS
+# splits text into ~100-character chunks and fetches each one separately, so
+# the provider derives its overall budget from this value (one timeout per
+# chunk plus a small margin).  The call runs in a worker thread, so a hung
+# request is abandoned instead of stalling the audio producer; the pipeline's
+# error path then takes over.
 _gtts_timeout_raw = float(os.environ.get("LUE_GTTS_TIMEOUT", "30"))
 GTTS_TIMEOUT = max(_gtts_timeout_raw, 5.0) if _gtts_timeout_raw > 0 else 30.0
 

@@ -2,12 +2,15 @@
 
 Completely free and keyless.  gTTS requires a network connection and will
 rate-limit aggressive use, but it handles its own 100-character chunking
-internally, so text can be passed straight through.
+internally, so text can be passed straight through.  Because every chunk is a
+separate HTTP request, the provider budgets ``chunks * GTTS_TIMEOUT`` for the
+whole sentence instead of a single per-request timeout.
 """
 
 import asyncio
 import io
 import logging
+import math
 import re
 
 from rich.console import Console
@@ -19,8 +22,27 @@ from .. import config
 # optionally followed by a region subtag (e.g. ``en``, ``ja``, ``zh-CN``).
 _LANG_PATTERN = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?$")
 
+# Endpoint domains Google serves: ``com``, ``co.uk``, ``co.in``, ``de``, ...
+# A typo here makes every request fail, so it is rejected at startup rather
+# than retried per sentence.
+_TLD_PATTERN = re.compile(r"^[a-z]{2,3}(?:\.[a-z]{2})?$")
+
 # Shown when the configured language is rejected, so the fix is obvious.
 _LANG_EXAMPLES = "en, fr, de, es, it, ja, zh-CN"
+
+# gTTS tokenises text into chunks of at most this many characters and performs
+# one HTTP request per chunk, so the overall budget must scale with the number
+# of chunks rather than being a single per-request timeout.
+_GTTS_CHUNK_CHARS = 100
+
+# Extra headroom on top of ``chunks * GTTS_TIMEOUT`` for DNS/TLS setup and the
+# final chunk of audio arriving just inside its own timeout.
+_GTTS_TOTAL_TIMEOUT_MARGIN = 10.0
+
+
+def _chunk_count(text: str) -> int:
+    """Estimate how many ~100-character chunks gTTS will request for ``text``."""
+    return max(1, math.ceil(len(text) / _GTTS_CHUNK_CHARS))
 
 
 class GTTTTS(TTSBase):
@@ -53,7 +75,9 @@ class GTTTTS(TTSBase):
         )
         self.voice = self.lang
         self.slow = config.GTTS_SLOW
-        self.tld = config.GTTS_TLD
+        # Normalised defensively here as well: the value is interpolated into
+        # the request URL, so stray whitespace/case would break every request.
+        self.tld = (config.GTTS_TLD or "").strip().lower() or "com"
         self._gtts_cls = None
 
     def _validate_lang(self, gtts_cls) -> bool:
@@ -112,8 +136,30 @@ class GTTTTS(TTSBase):
             self.voice = normalized
         return True
 
+    def _validate_tld(self) -> bool:
+        """Reject a malformed ``LUE_GTTS_TLD`` before any request is made.
+
+        gTTS interpolates the value straight into the request URL, so a typo
+        such as ``LUE_GTTS_TLD=comm`` raises ``gTTSError`` for every sentence,
+        which the pipeline would keep retrying.  Failing once at startup keeps
+        the failure visible and actionable.
+        """
+        if _TLD_PATTERN.match(self.tld or ""):
+            return True
+
+        self.console.print(
+            f"[bold red]Error: '{self.tld}' is not a valid gTTS top-level domain.[/bold red]"
+        )
+        self.console.print(
+            "[yellow]Use a Google domain such as 'com', 'co.uk', 'co.in', "
+            "'de', or 'fr'; LUE_GTTS_TLD is currently "
+            f"'{self.tld}'.[/yellow]"
+        )
+        logging.error("Invalid gTTS top-level domain: %r", self.tld)
+        return False
+
     async def initialize(self) -> bool:
-        """Check the ``gTTS`` package and the configured language code."""
+        """Check the ``gTTS`` package, the language code and the endpoint domain."""
         try:
             from gtts import gTTS
         except ImportError:
@@ -129,11 +175,23 @@ class GTTTTS(TTSBase):
         if not self._validate_lang(gTTS):
             return False
 
+        if not self._validate_tld():
+            return False
+
         self._gtts_cls = gTTS
         self.initialized = True
         self.console.print("[green]gTTS model is available.[/green]")
         logging.info("gTTS TTS initialised (lang=%s, tld=%s, slow=%s).", self.lang, self.tld, self.slow)
         return True
+
+    def _total_timeout(self, text: str) -> float:
+        """Overall budget for synthesising ``text`` (per-request timeout × chunks).
+
+        gTTS issues one HTTP request per ~100-character chunk; using the
+        per-request timeout for the whole sentence would abort long sentences
+        while their later chunks are still perfectly healthy.
+        """
+        return _chunk_count(text) * config.GTTS_TIMEOUT + _GTTS_TOTAL_TIMEOUT_MARGIN
 
     def get_overlap_seconds(self) -> float | None:
         """Deprecated; this provider has no overlap override (spec-v3 §9.1).
@@ -164,18 +222,22 @@ class GTTTTS(TTSBase):
             tts.write_to_fp(buffer)
             return buffer.getvalue()
 
-        # A worker thread cannot be cancelled, so buffer the payload and only
-        # write it once the request finished in time.  A timed-out attempt
-        # therefore never leaves a partial/stale file behind for the retry.
+        # asyncio.to_thread cannot be cancelled mid-flight: on timeout the
+        # worker thread keeps running until its own per-request socket
+        # timeout fires, and whatever it eventually returns is discarded.
+        # Buffering the payload and writing only after a successful wait
+        # therefore guarantees a timed-out attempt never leaves a partial or
+        # stale file behind for the retry path.
+        timeout = self._total_timeout(text)
         try:
             payload = await asyncio.wait_for(
                 asyncio.to_thread(_blocking_generate),
-                timeout=config.GTTS_TIMEOUT,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
             raise asyncio.TimeoutError(
-                f"gTTS request timed out after {config.GTTS_TIMEOUT}s "
-                f"for text: '{text[:50]}...'"
+                f"gTTS request timed out after {timeout:.0f}s for "
+                f"{_chunk_count(text)} chunk(s) of text: '{text[:50]}...'"
             ) from None
 
         with open(output_path, "wb") as f:

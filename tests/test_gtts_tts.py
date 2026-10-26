@@ -25,7 +25,7 @@ def _install_fake_gtts(monkeypatch, payload: bytes = b"\xff\xfbGTTSPAYLOAD") -> 
 
     class gTTS:
         def __init__(self, text=None, lang=None, slow=False, tld=None, **kwargs):
-            calls.update(text=text, lang=lang, slow=slow, tld=tld)
+            calls.update(text=text, lang=lang, slow=slow, tld=tld, **kwargs)
 
         def write_to_fp(self, fp):
             fp.write(payload)
@@ -191,9 +191,104 @@ async def test_initialize_normalizes_deprecated_lang(monkeypatch, mock_console):
     assert tts.voice == "en"
 
 
+def test_tld_pattern_accepts_google_domains():
+    """The accepted shape is ``com``, ``co.uk``, ``co.in``, ``de`` — not 'comm'."""
+    from lue.tts.gtts_tts import _TLD_PATTERN
+
+    for ok in ("com", "co.uk", "co.in", "de", "fr", "us"):
+        assert _TLD_PATTERN.match(ok), ok
+
+    for bad in ("", "c", "comm", "c0m", "google.com", "co.uk.", ".com"):
+        assert not _TLD_PATTERN.match(bad), bad
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tld", ["com", "co.uk", "co.in", "de"])
+async def test_initialize_accepts_valid_tld(monkeypatch, mock_console, tld):
+    monkeypatch.setattr(config, "GTTS_TLD", tld)
+    tts = GTTTTS(mock_console)
+    _install_fake_gtts(monkeypatch)
+
+    assert await tts.initialize() is True
+    assert tts.tld == tld
+
+
+def test_tld_is_normalized(monkeypatch, mock_console):
+    """Whitespace/case in LUE_GTTS_TLD must not reach the request URL verbatim."""
+    monkeypatch.setattr(config, "GTTS_TLD", "  CO.UK  ")
+    assert GTTTTS(mock_console).tld == "co.uk"
+
+
+@pytest.mark.asyncio
+async def test_initialize_rejects_malformed_tld(monkeypatch):
+    """A TLD typo must fail once at startup instead of on every sentence."""
+    console = Console(record=True, width=200)
+    monkeypatch.setattr(config, "GTTS_TLD", "comm")
+    tts = GTTTTS(console)
+    _install_fake_gtts(monkeypatch)
+
+    assert await tts.initialize() is False
+    assert tts.initialized is False
+    text = console.export_text()
+    assert "not a valid gTTS top-level domain" in text
+    assert "co.uk" in text
+
+
+def test_chunk_count_matches_gtts_chunking():
+    """gTTS requests one chunk per ~100 characters (minimum one)."""
+    from lue.tts.gtts_tts import _chunk_count
+
+    assert _chunk_count("") == 1
+    assert _chunk_count("Hello.") == 1
+    assert _chunk_count("a" * 100) == 1
+    assert _chunk_count("a" * 101) == 2
+    assert _chunk_count("a" * 1000) == 10
+
+
+def test_total_timeout_scales_per_chunk(monkeypatch, tts):
+    """The outer wait_for budget is per-request timeout × chunks + margin."""
+    from lue.tts import gtts_tts
+
+    monkeypatch.setattr(config, "GTTS_TIMEOUT", 2.0)
+    monkeypatch.setattr(gtts_tts, "_GTTS_TOTAL_TIMEOUT_MARGIN", 5.0)
+
+    assert tts._total_timeout("Hello.") == pytest.approx(7.0)
+    # 10 chunks × 2s + 5s margin: a long sentence is no longer capped at 2s.
+    assert tts._total_timeout("a" * 1000) == pytest.approx(25.0)
+
+
+@pytest.mark.asyncio
+async def test_long_text_is_not_aborted_by_per_request_timeout(
+    monkeypatch, mock_console, tmp_output_dir
+):
+    """A sentence needing several chunk requests may exceed one timeout."""
+    tts = GTTTTS(mock_console)
+    module = types.ModuleType("gtts")
+
+    class gTTS:
+        def __init__(self, text=None, lang=None, slow=False, tld=None, **kwargs):
+            pass
+
+        def write_to_fp(self, fp):
+            time.sleep(0.4)  # > GTTS_TIMEOUT, < total budget for 10 chunks
+            fp.write(b"long")
+
+    module.gTTS = gTTS
+    monkeypatch.setitem(sys.modules, "gtts", module)
+    monkeypatch.setattr(config, "GTTS_TIMEOUT", 0.1)
+
+    assert await tts.initialize() is True
+    out = tmp_output_dir / "long.mp3"
+    await tts.generate_audio("a" * 1000, str(out))
+
+    assert out.read_bytes() == b"long"
+
+
 @pytest.mark.asyncio
 async def test_generate_audio_timeout(monkeypatch, tmp_output_dir):
-    """A hung network call must time out instead of stalling the producer."""
+    """A hung chunk must time out instead of stalling the producer."""
+    from lue.tts import gtts_tts
+
     console = Console(record=True, width=200)
     tts = GTTTTS(console)
     module = types.ModuleType("gtts")
@@ -209,6 +304,8 @@ async def test_generate_audio_timeout(monkeypatch, tmp_output_dir):
     module.gTTS = gTTS
     monkeypatch.setitem(sys.modules, "gtts", module)
     monkeypatch.setattr(config, "GTTS_TIMEOUT", 0.05)
+    # Drop the fixed headroom so the test does not wait 10s for the budget.
+    monkeypatch.setattr(gtts_tts, "_GTTS_TOTAL_TIMEOUT_MARGIN", 0.0)
 
     assert await tts.initialize() is True
     out = tmp_output_dir / "timeout.mp3"
@@ -231,6 +328,8 @@ async def test_generate_audio(monkeypatch, tts, tmp_output_dir):
     assert out.read_bytes() == b"GTTS-AUDIO"
     assert calls["text"] == "Hello there."
     assert calls["lang"] == "en"
+    # The per-request (per-chunk) timeout is handed to gTTS itself.
+    assert calls["timeout"] == config.GTTS_TIMEOUT
 
 
 @pytest.mark.asyncio
