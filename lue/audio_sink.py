@@ -227,13 +227,23 @@ class DecodeJob:
 
 
 class SegmentTable:
+    """Ordered segment timeline for the sink generation (§4.3).
+
+    ``out_start`` values are monotonically non-decreasing, so the timeline end
+    (the value callers care about for pacing and highlighting) is maintained
+    incrementally instead of being rescanned: ``total_duration()`` is O(1) and
+    is called on every 20 ms write chunk.
+    """
+
     def __init__(self):
         self.segments: list[Segment] = []
         self._open: Segment | None = None
+        self._end: float = 0.0
 
     def open_segment(self, seg: Segment) -> Segment:
         self._open = seg
         self.segments.append(seg)
+        self._advance_end(seg)
         return seg
 
     def extend(self, nbytes: int) -> None:
@@ -241,17 +251,20 @@ class SegmentTable:
             return
         self._open.written_bytes += nbytes
         self._open.out_duration = self._open.written_bytes / BYTES_PER_SEC
+        self._advance_end(self._open)
 
     def close_segment(self) -> Segment | None:
         seg = self._open
         self._open = None
         return seg
 
+    def _advance_end(self, seg: Segment) -> None:
+        end = seg.out_start + seg.out_duration
+        if end > self._end:
+            self._end = end
+
     def total_duration(self) -> float:
-        total = 0.0
-        for seg in self.segments:
-            total = max(total, seg.out_start + seg.out_duration)
-        return total
+        return self._end
 
     def find(self, P: float) -> Segment | None:
         if not self.segments:
@@ -267,11 +280,17 @@ class SegmentTable:
     def clear(self) -> None:
         self.segments.clear()
         self._open = None
+        self._end = 0.0
 
     def discard_generation(self, gen: int) -> None:
         self.segments = [s for s in self.segments if s.generation != gen]
         if self._open is not None and self._open.generation == gen:
             self._open = None
+        # The removed generation could have been the timeline tail, so this
+        # (rare) path has to rescan.
+        self._end = max(
+            (s.out_start + s.out_duration for s in self.segments), default=0.0
+        )
 
 
 # ── Sink clock (§4.3) ──────────────────────────────────────────────────────
@@ -403,14 +422,15 @@ async def _run_decode_once(reader, gen: int, job: DecodeJob, seg: Segment) -> tu
                     pass
 
 
-def _safe_remove(path: str) -> None:
+async def _safe_remove(path: str) -> None:
+    """Best-effort unlink with retries; must never block the event loop (§9.4)."""
     for _ in range(5):
         try:
             if os.path.exists(path):
                 os.remove(path)
             return
         except OSError:
-            time.sleep(0.02)
+            await asyncio.sleep(0.02)
 
 
 async def _decode_and_write(reader, gen: int, job: DecodeJob) -> None:
@@ -460,7 +480,7 @@ async def _decode_and_write(reader, gen: int, job: DecodeJob) -> None:
     finally:
         if table._open is seg:
             table.close_segment()
-        _safe_remove(job.file_path)
+        await _safe_remove(job.file_path)
 
 
 # ── writer_task (§3.1, §8) ─────────────────────────────────────────────────

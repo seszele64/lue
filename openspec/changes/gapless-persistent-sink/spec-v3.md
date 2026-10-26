@@ -19,7 +19,7 @@ migration, a restart state machine, and a verification harness with real fixture
 |-----|--------------|
 | **G1** | New **§3.1** fixes the exact sink `ffplay` argv, the exact `create_subprocess_exec` call, `stdin=PIPE` / `stdout=stderr=DEVNULL`, the **no `-af` / no `-nostdin`** rule, fd-passing semantics, and the single **StreamWriter owner** (`writer_task`). |
 | **G2** | **§4.2 / §4.5 / §5.6** disambiguate `SINK_PRIME_MS` (a buffering watermark with **no sleep**) from the `SINK_LEAD` anchor (`t_first_write + 250 ms`, which stays pinned at first-write + LEAD). |
-| **G3** | **§5.4 / §9.2** make `_kill_audio_immediately` thread-safe for the non-async input thread: it **only** bumps the token and kills by PID; fd close/reaping stay in the 10-step teardown under `audio_restart_lock` (with `loop.call_soon_threadsafe` as the fallback). |
+| **G3** | **§5.4 / §9.2** make `_kill_audio_immediately` safe for the synchronous stdin reader callback (which runs on the event-loop thread, not a separate input thread): it **only** bumps the token and kills by PID; fd close/reaping stay in the 10-step teardown under `audio_restart_lock`. Because both run on the same thread, `loop.call_soon_threadsafe` is moot; the fallback, if ever needed, is plain `loop.call_soon`. |
 | **G4** | **§6.3 / §13** add the `reader.py:689-718` `_increase_speed`/`_decrease_speed` migration row: grid changes from `range(10,31)` (1.0–3.0) to `SPEED_MIN=0.5` / `SPEED_MAX=4.0`. |
 | **G5** | **§5.2** (decoder tasks run inline), **§12/§13** (`--over` coerced then ignored), **§14.1** (CapCut fixture optional / skippable), **§4.5/§14.2** (`t_audible` is a normative fake-sink output). |
 | — | New **ADR-6** (explicit sink argv + single stdin owner). |
@@ -43,7 +43,7 @@ migration, a restart state machine, and a verification harness with real fixture
 | — | Full state inventory missed prior | §10 | Closed (complete table) |
 | **G1** | Sink `ffplay` argv + stdin ownership not exact | **§3.1**, §13, ADR-6 | Resolved (exact argv; single StreamWriter owner) |
 | **G2** | `SINK_PRIME_MS` vs `SINK_LEAD` anchor ambiguous | **§4.2**, **§4.5**, **§5.6** | Resolved (watermark vs anchor; no sleep) |
-| **G3** | `_kill_audio_immediately` thread-safety (input thread, non-async) | **§5.4**, **§9.2** | Resolved (PID kill + token bump; teardown owns fd) |
+| **G3** | `_kill_audio_immediately` safety (sync stdin callback, event-loop thread) | **§5.4**, **§9.2** | Resolved (PID kill + token bump; teardown owns fd) |
 | **G4** | `reader.py:689-718` speed range 1.0–3.0 not migrated | **§6.3**, §13 | Resolved (`SPEED_MIN/MAX = 0.5/4.0`) |
 | G5a | "cancel all decoder tasks" ambiguous (decoder inline?) | **§5.2 step 4** | Resolved (decoders run inline in `writer_task`) |
 | G5b | `--over` handling unspecified | **§12**, §13 | Resolved (argparse coerces; value ignored) |
@@ -194,8 +194,8 @@ sink._stdin = proc.stdin                       # asyncio.StreamWriter (write end
     `EOF_SENTINEL` path, §8.3) **or** by `stop_and_clear_audio` step 5 (after
     `writer_task` is cancelled, §5.2). Whichever runs first closes; the other is a
     no-op.
-  - `_kill_audio_immediately` (input thread) **never** touches the StreamWriter
-    (G3, §5.4 / §9.2).
+  - `_kill_audio_immediately` (stdin reader callback, same loop thread) **never** touches
+    the StreamWriter (G3, §5.4 / §9.2).
   - No task writes to stdin after its generation is invalid (I5).
 
 ---
@@ -357,7 +357,8 @@ sink flushes and `-autoexit` can exit on EOF).
 - `_restart_audio_after_navigation` (`reader.py:955-973`): keep `audio_restart_lock`;
   inside, call `stop_and_clear_audio` then `play_from_current_position`.
 - `_kill_audio_immediately` (`input_handler.py:296-307`): rewrite (§9.2, G3). It runs
-  on the **non-async input thread**, so it may touch only plain state; it **bumps the
+  synchronously in the **stdin reader callback on the event-loop thread** (there is no
+  separate input thread), so it may not `await` or block; it **bumps the
   token and kills by PID** and does nothing else. The follow-up navigation command
   performs the full 10-step teardown **under `audio_restart_lock` on the event loop**,
   which owns fd close and process reaping.
@@ -595,7 +596,7 @@ ffmpeg -nostdin -hide_banner -loglevel error \
 | `sink.kill()→wait` | `SINK_KILL_TIMEOUT_S = 0.2` |
 | post-EOF sink exit | `SINK_EOF_TIMEOUT_S = 3.0` |
 | task cancel/join | `TASK_CANCEL_TIMEOUT_S = 1.0` |
-| decoder terminate | `DECODER_TERM_TIMEOUT_S = 0.3` |
+| decoder terminate | `DECODE_TERM_TIMEOUT_S = 0.3` |
 
 ---
 
@@ -613,7 +614,7 @@ ffmpeg -nostdin -hide_banner -loglevel error \
 - `tests/test_gtts_tts.py` asserts `is None` (and a new test asserts the deprecation warning).
 - No clamp range `[150,250] ms` exists in v3; this removes the contradiction.
 
-### 9.2 P1-2 / G3 — `pkill` scoping and `_kill_audio_immediately` thread-safety
+### 9.2 P1-2 / G3 — `pkill` scoping and `_kill_audio_immediately` safety
 - Remove `pkill -f ffplay` (`input_handler.py:304`) and `pkill -9 -f 'ffplay.*buffer_'`
   (`audio.py:67`).
 - Kill by tracked PID only: `os.kill(sink.pid, SIGKILL)` / `os.kill(decoder.pid, SIGKILL)`,
@@ -621,12 +622,16 @@ ffmpeg -nostdin -hide_banner -loglevel error \
 - Fallback (only if a PID is unknown) uses the app-scoped tag: the sink is launched with
   `-window_title lue-audio-sink-<pid>-<gen>` (§3.1) and `pkill -f 'lue-audio-sink-'`;
   this never matches unrelated ffplay processes.
-- **`_kill_audio_immediately` (G3) is thread-safe because it is non-async.** It runs on
-  the raw-key input thread, so it must not touch event-loop-owned objects (StreamWriter,
-  Queue, Task). **Preferred implementation:**
+- **`_kill_audio_immediately` (G3) is safe because it is a synchronous, non-blocking
+  callback.** It is reached from the stdin reader registered with
+  `loop.add_reader(sys.stdin.fileno(), input_handler.process_input, reader)` inside
+  `reader.run`, so it executes on the **event-loop thread** — there is no separate raw-key
+  input thread. What constrains it is that the callback cannot `await`: it must not block,
+  and it must not start or join the async teardown from inside the callback (teardown owns
+  StreamWriter/Queue/Task lifecycles). **Preferred implementation:**
   ```python
   def _kill_audio_immediately(reader):
-      reader.audio_generation += 1          # plain int assign (atomic under the GIL)
+      reader.audio_generation += 1          # plain int assign
       sink = reader.sink
       if sink is not None and sink.pid:
           try: os.kill(sink.pid, signal.SIGKILL)
@@ -634,16 +639,17 @@ ffmpeg -nostdin -hide_banner -loglevel error \
       # Do NOT close stdin / reap here — the 10-step teardown owns fd close.
   ```
   i.e. it **only kills by PID and bumps the token**; the follow-up navigation command
-  runs `stop_and_clear_audio` on the loop (steps 5–6) under `audio_restart_lock`, which
-  closes the StreamWriter fd and reaps the process. The token bump makes `writer_task`
-  abort at its next generation check, so no further bytes are written in the meantime.
+  posts a command, and `stop_and_clear_audio` runs on the loop (steps 5–6) under
+  `audio_restart_lock`, which closes the StreamWriter fd and reaps the process. The token
+  bump makes `writer_task` abort at its next generation check, so no further bytes are
+  written in the meantime.
 - **Alternative (only if immediate fd closure is truly required):**
-  `reader.loop.call_soon_threadsafe(reader.sink.close_stdin)` after the token bump and
-  SIGKILL; teardown still runs afterward. The former is preferred because it keeps a
-  single writer/owner of the fd and avoids any cross-thread close race.
-- Rejected: any `subprocess.run(...)` / `pkill` on the input thread (blocks the reader
-  loop, races teardown), and closing the `StreamWriter` directly from the thread
-  (`StreamWriter.close()` is not thread-safe).
+  `reader.loop.call_soon(reader.sink.close_stdin)` after the token bump and SIGKILL;
+  teardown still runs afterward. The former is preferred because it keeps a single
+  writer/owner of the fd and avoids any close/suspend race with `writer_task`.
+- Rejected: any `subprocess.run(...)` / `pkill` in the reader callback (blocks the event
+  loop, races teardown), and closing the `StreamWriter` directly from the callback
+  (`writer_task` is the sole owner, §3.1; a close racing its `drain()` is undefined).
 
 ### 9.3 P1-3 — pause overshoot
 - Overshoot in the current design comes from `await asyncio.sleep(actual_duration - overlap)`
@@ -686,7 +692,7 @@ ffmpeg -nostdin -hide_banner -loglevel error \
 | `running` | bool | True | main | loops | `_shutdown` |
 | `is_paused` | bool | False | main | pause handler | — |
 | `playback_speed` | float | 1.0 | main | speed handlers | reset? no |
-| `audio_generation` | int | 0 | main | every teardown; loops; input thread (§9.2) | never (monotonic) |
+| `audio_generation` | int | 0 | main | every teardown; loops; stdin reader callback (§9.2) | never (monotonic) |
 | `producer_task` | Task\|None | None | pipeline | `play_from_current_position` | teardown step 2 |
 | `player_task` | Task\|None | None | pipeline | sink supervisor | teardown step 7 |
 | `writer_task` | Task\|None | None | pipeline | feeds sink; **sole stdin owner (§3.1)** | teardown step 3 |
@@ -801,7 +807,7 @@ builder.
 | `lue/reader.py` | `_handle_pause_toggle` 1073-1089 | Snapshot P; lock order; resume offset |
 | **`lue/reader.py`** | **`_increase_speed`/`_decrease_speed` 689-718 (G4)** | **Replace `speed_levels = range(10,31)` (1.0–3.0) with the `SPEED_MIN=0.5`/`SPEED_MAX=4.0`/`SPEED_STEP=0.1` grid; allow decrease below 1.0; snap off-grid values to nearest level; clamp; restart only if changed (§6.3)** |
 | `lue/reader.py` | `_get_speed_display` 720+ | No change |
-| `lue/input_handler.py` | `_kill_audio_immediately` 296-307 | PID kill + token bump only; thread-safe (no `pkill`/`subprocess.run`, no fd close) (§9.2, G3) |
+| `lue/input_handler.py` | `_kill_audio_immediately` 296-307 | PID kill + token bump only; safe from the sync reader callback (no `pkill`/`subprocess.run`, no fd close) (§9.2, G3) |
 | `lue/config.py` | 104-109 | New sink/speed constants; deprecate overlap; `AUDIO_TMP_ROOT`; flag |
 | `lue/__main__.py` | 168-170, 200-206, 241-242, 310-312 | `--speed` clamp/validate; `--over` coerce-then-ignore (drop assignment at 241-242 and `overlap=` at 310); `--legacy-audio`, `--trim-silence` |
 | `lue/tts/base.py` | `get_overlap_seconds` | Return `None` |
@@ -931,8 +937,8 @@ fixtures; network/key steps are manual/CI-gated; Kokoro fixtures are offline.
 - **Decision:** Pin the exact `ffplay` argv (§3.1) with `stdin=PIPE`,
   `stdout=stderr=DEVNULL`, no `-af`, no `-nostdin`; the generation's `writer_task` is
   the sole owner/writer of the `StreamWriter`; teardown (loop) is the sole closer;
-  `_kill_audio_immediately` (input thread) only bumps the token + SIGKILLs by PID (G3).
-- **Consequences (+):** fd lifecycle, EOF delivery, and cross-thread safety are
+  `_kill_audio_immediately` (stdin reader callback) only bumps the token + SIGKILLs by PID (G3).
+- **Consequences (+):** fd lifecycle, EOF delivery, and callback safety are
   unambiguous and testable (T16/T18). (−): stricter ownership rules the implementer
   must preserve (no ad-hoc stdin writes, no fd close off-loop).
 
@@ -964,5 +970,7 @@ fixtures; network/key steps are manual/CI-gated; Kokoro fixtures are offline.
    after the deprecation warning.
 5. For `_kill_audio_immediately` (G3): confirm the follow-up navigation command always
    runs the full teardown under `audio_restart_lock` (the spec's assumption); if any
-   nav path can skip it, the `loop.call_soon_threadsafe(close_stdin)` fallback (§9.2)
-   becomes mandatory rather than optional.
+   nav path can skip it, schedule `loop.call_soon(sink.close_stdin)` as a best-effort
+   fallback (§9.2). Note this is `call_soon`, not `call_soon_threadsafe`: the reader
+   callback already runs on the event-loop thread, so thread-safety is moot and only
+   the ordering (schedule after the SIGKILL, before the next write) matters.

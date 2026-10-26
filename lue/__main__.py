@@ -179,7 +179,10 @@ async def main():
     parser.add_argument(
         "--trim-silence",
         action="store_true",
-        help="Conservatively trim leading/trailing silence during decode",
+        help=(
+            "Conservatively trim leading/trailing silence during decode "
+            "(persistent sink only; no effect with --legacy-audio)"
+        ),
     )
     
     parser.add_argument(
@@ -275,6 +278,13 @@ async def main():
         config.USE_PERSISTENT_SINK = False
     if args.trim_silence:
         config.TRIM_SILENCE = True
+        if not config.USE_PERSISTENT_SINK:
+            # Decode-time silenceremove (§7.3) only exists in the sink decode
+            # chain; the legacy pipeline would silently ignore the flag.
+            console.print(
+                "[yellow]Warning: --trim-silence only applies to the "
+                "persistent sink; ignored with --legacy-audio.[/yellow]"
+            )
 
     if args.mode is not None:
         config.UI_MODE = args.mode

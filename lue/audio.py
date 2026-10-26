@@ -80,7 +80,17 @@ def clean_tts_text(text: str) -> str:
 
 async def _cancel_task(task):
     """Cancel ``task`` and await it with a bounded timeout (tolerate anything)."""
-    if task is None or task.done():
+    if task is None:
+        return
+    if task.done():
+        # A finished task that raised (or was already cancelled) would otherwise
+        # never have its exception retrieved, so asyncio logs "Task exception
+        # was never retrieved" during teardown.  Consume it here.
+        if not task.cancelled():
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
         return
     task.cancel()
     try:

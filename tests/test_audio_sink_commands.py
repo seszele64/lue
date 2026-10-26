@@ -77,12 +77,17 @@ async def test_sink_start_argv(monkeypatch):
 
 
 def _fake_reader() -> SimpleNamespace:
+    async def _noop_restart() -> None:
+        """Stand-in for ``Lue._restart_audio_after_navigation``."""
+
     return SimpleNamespace(
         console=Mock(),
         audio_generation=1,
         producer_task=None,
         writer_task=None,
         player_task=None,
+        pending_restart_task=None,
+        _restart_audio_after_navigation=_noop_restart,
         playback_finished_event=asyncio.Event(),
         _sink_eof_intended=False,
         sink=None,
@@ -173,6 +178,18 @@ async def test_start_persistent_clears_state_when_sink_binary_missing(
 async def test_start_persistent_wires_tasks_when_sink_alive(monkeypatch, tmp_path):
     fallback = {"called": False}
 
+    class _FakeStdin:
+        """Minimal StreamWriter contract used by ``writer_task`` on EOF."""
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            return None
+
     async def fake_start_legacy(reader):
         fallback["called"] = True
 
@@ -180,13 +197,13 @@ async def test_start_persistent_wires_tasks_when_sink_alive(monkeypatch, tmp_pat
         def __init__(self, gen):
             self.generation = gen
             self.proc = SimpleNamespace(returncode=None)
-            self.stdin = None
+            self.stdin = _FakeStdin()
 
         async def start(self):
             return self
 
         def close_stdin(self):
-            pass
+            self.stdin.close()
 
         async def wait(self):
             return 0
@@ -205,14 +222,25 @@ async def test_start_persistent_wires_tasks_when_sink_alive(monkeypatch, tmp_pat
     assert fallback["called"] is False
     assert reader.sink is not None
 
-    for attr in ("writer_task", "producer_task", "player_task"):
-        task = getattr(reader, attr)
-        assert task is not None
+    # Let the supervisor observe the (fake) sink exit.  It must take the
+    # "exited before EOF" branch and schedule a restart through the reader
+    # contract instead of raising AttributeError on a bare namespace.
+    await reader.player_task
+    assert reader.playback_finished_event.is_set()
+    assert reader.pending_restart_task is not None
+
+    tasks = [
+        getattr(reader, attr)
+        for attr in ("writer_task", "producer_task", "pending_restart_task")
+    ]
+    for task in tasks:
         task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Teardown-cancelled tasks may only surface CancelledError or a clean exit;
+    # anything else means the fake reader violated the supervisor contract.
+    assert all(
+        isinstance(result, (asyncio.CancelledError, type(None))) for result in results
+    ), results
 
 # ── C1: legacy player must never overlap two ffplay processes ─────────────
 
