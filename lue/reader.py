@@ -1177,12 +1177,31 @@ class Lue:
             seg = table.find(p_p)
         except Exception:  # noqa: BLE001
             return None
-        if seg is None or seg.is_silence or seg.pos is None:
+        if seg is None:
             return None
+        if seg.is_silence or seg.pos is None:
+            # Paused inside an underrun/priming pad: there is no audible
+            # sentence to seek into.  Resume at the sentence *after* the last
+            # real segment instead of dropping the snapshot (which would
+            # restart the current sentence and replay the pad).
+            base_pos = getattr(getattr(self, "_sink_seg", None), "pos", None)
+            if base_pos is None and table is not None:
+                for prior in reversed(table.segments):
+                    if not prior.is_silence and prior.pos is not None:
+                        base_pos = prior.pos
+                        break
+            if base_pos is None:
+                return None
+            next_pos = self._advance_position(base_pos, wrap=False)
+            return (next_pos, 0.0) if next_pos else None
         local_out = max(0.0, p_p - seg.out_start)
         resume_src = seg.src_offset + local_out * seg.speed
         if seg.src_duration and resume_src >= seg.src_duration - 0.05:
-            return None
+            # Too close to the sentence end to be worth seeking: continue with
+            # the next sentence rather than replaying the tail (or returning
+            # None, which resumes at the *current* sentence start).
+            next_pos = self._advance_position(seg.pos, wrap=False)
+            return (next_pos, 0.0) if next_pos else None
         if resume_src <= 0.0:
             return None
         return (seg.pos, resume_src)
@@ -1341,7 +1360,7 @@ class Lue:
                     span = end - start
                     if span > 0:
                         per = span / len(mapped)
-                        sub = min(int((local_src - start) / per), len(mapped) - 1)
+                        sub = max(0, min(int((local_src - start) / per), len(mapped) - 1))
                         return min(mapped[sub], total_words - 1)
                     return min(mapped[-1], total_words - 1)
             return min(tts_idx, total_words - 1)

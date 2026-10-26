@@ -8,11 +8,16 @@ startup (silent TTS).  See diagnosis: ``lue/audio_sink.py``.
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 
 from lue import audio, audio_sink, config
+from lue import __main__ as cli_main
 from lue.reader import Lue
 
 
@@ -101,12 +106,19 @@ async def test_start_persistent_falls_back_when_sink_exits_immediately(
         fallback["called"] = True
 
     class DeadSink:
+        last = None
+
         def __init__(self, gen):
             self.generation = gen
             self.proc = SimpleNamespace(returncode=1)
+            self.closed = False
+            DeadSink.last = self
 
         async def start(self):
             return self
+
+        def close_stdin(self):
+            self.closed = True
 
     monkeypatch.setattr(audio_sink, "SinkProcess", DeadSink)
     monkeypatch.setattr(audio, "_start_legacy", fake_start_legacy)
@@ -118,7 +130,44 @@ async def test_start_persistent_falls_back_when_sink_exits_immediately(
 
     assert fallback["called"] is True
     assert reader.sink is None
+    # W1: the failed generation's clock/table must not survive, otherwise the
+    # highlight loop keeps using the dead sink instead of the legacy path.
+    assert reader.sink_clock is None
+    assert reader.segment_table is None
+    # W1: close the write end even though the process already exited.
+    assert DeadSink.last.closed is True
     reader.console.print.assert_called()
+
+
+async def test_start_persistent_clears_state_when_sink_binary_missing(
+    monkeypatch, tmp_path
+):
+    """W1: a FileNotFoundError fallback must not leak clock/table or an fd."""
+
+    fallback = {"called": False}
+
+    async def fake_start_legacy(reader):
+        fallback["called"] = True
+
+    class MissingSink:
+        def __init__(self, gen):
+            self.generation = gen
+            self.proc = None
+
+        async def start(self):
+            raise FileNotFoundError("ffplay")
+
+    monkeypatch.setattr(audio_sink, "SinkProcess", MissingSink)
+    monkeypatch.setattr(audio, "_start_legacy", fake_start_legacy)
+    monkeypatch.setattr(audio_sink, "make_session_dir", lambda gen: str(tmp_path))
+
+    reader = _fake_reader()
+    await audio._start_persistent(reader)
+
+    assert fallback["called"] is True
+    assert reader.sink is None
+    assert reader.sink_clock is None
+    assert reader.segment_table is None
 
 
 async def test_start_persistent_wires_tasks_when_sink_alive(monkeypatch, tmp_path):
@@ -583,3 +632,161 @@ async def test_navigation_restart_does_not_inherit_resume(monkeypatch):
 
     assert calls == [False]
     assert reader._resume is None
+
+
+# ── W2: sub-word mapping must clamp before the first timing ────────────────
+
+
+def test_word_index_clamps_before_first_timing():
+    """A local_src before timings[0] must map to the first sub-word (0)."""
+    reader = SimpleNamespace(current_sentence_words=["Alpha", "beta"])
+    seg = audio_sink.Segment(
+        generation=1,
+        pos=(0, 0, 0),
+        out_start=0.0,
+        src_duration=3.0,
+        word_timings=[("alpha", 1.0, 2.0)],
+        word_mapping=[0, 0],  # one TTS word split across two output words
+    )
+
+    # Without the max(0, ..) clamp this returns mapped[-1] (1).
+    assert Lue._word_index_for_segment(reader, seg, 0.5, 0.5) == 0
+
+
+# ── W3: pause in silence / at the very end resumes the next sentence ───────
+
+
+def _resume_reader(chapters):
+    reader = SimpleNamespace(chapters=chapters, _sink_seg=None)
+    reader._advance_position = MethodType(Lue._advance_position, reader)
+    return reader
+
+
+async def test_pause_in_silence_resumes_next_sentence():
+    table = audio_sink.SegmentTable()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=1, pos=(0, 0, 0), out_start=0.0,
+            out_duration=2.0, src_duration=2.0,
+        )
+    )
+    table.close_segment()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=1, pos=None, out_start=2.0,
+            out_duration=0.5, is_silence=True,
+        )
+    )
+
+    reader = _resume_reader([["First. Second."]])
+    reader.sink_clock = _StaticClock(2.1)
+    reader.segment_table = table
+
+    assert Lue._snapshot_resume_position(reader) == ((0, 0, 1), 0.0)
+
+
+async def test_pause_in_final_50ms_resumes_next_sentence():
+    table = audio_sink.SegmentTable()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=1, pos=(0, 0, 0), out_start=0.0,
+            out_duration=10.0, src_duration=10.0,
+        )
+    )
+
+    reader = _resume_reader([["First sentence. Second sentence."]])
+    reader.sink_clock = _StaticClock(9.96)  # 40 ms before src_duration
+    reader.segment_table = table
+
+    assert Lue._snapshot_resume_position(reader) == ((0, 0, 1), 0.0)
+
+
+async def test_pause_at_end_of_book_returns_none():
+    table = audio_sink.SegmentTable()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=1, pos=(0, 0, 0), out_start=0.0,
+            out_duration=10.0, src_duration=10.0,
+        )
+    )
+
+    reader = _resume_reader([["Only sentence."]])
+    reader.sink_clock = _StaticClock(9.96)
+    reader.segment_table = table
+
+    assert Lue._snapshot_resume_position(reader) is None
+
+
+# ── W4: CLI exit codes are propagated (no swallow in cli()) ────────────────
+
+
+def test_cli_propagates_system_exit(monkeypatch):
+    def fake_run(coro):
+        coro.close()
+        raise SystemExit(2)
+
+    monkeypatch.setattr(cli_main.asyncio, "run", fake_run)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_main.cli()
+    assert excinfo.value.code == 2
+
+
+def test_cli_returns_cleanly_on_valid_run(monkeypatch):
+    def fake_run(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(cli_main.asyncio, "run", fake_run)
+
+    assert cli_main.cli() is None
+
+
+@pytest.mark.parametrize("speed", ["0.2", "5", "abc"])
+def test_cli_invalid_speed_exits_2(speed):
+    root = Path(__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-m", "lue", "--speed", speed],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stdout, proc.stderr)
+
+
+# ── W5: a decoder-spawn crash must fail closed, not wedge the sink ─────────
+
+
+async def test_writer_fails_closed_when_decoder_spawn_fails(monkeypatch, tmp_path):
+    async def boom(*args, **kwargs):
+        raise FileNotFoundError("ffmpeg")
+
+    monkeypatch.setattr(audio_sink.asyncio, "create_subprocess_exec", boom)
+
+    sink = _FakeSink()
+    reader = SimpleNamespace(
+        audio_generation=1,
+        sink=sink,
+        sink_clock=audio_sink.SinkClock(),
+        segment_table=audio_sink.SegmentTable(),
+        decode_queue=asyncio.Queue(),
+        _sink_eof_intended=False,
+    )
+    writer = asyncio.create_task(audio_sink.writer_task(reader, 1))
+    await asyncio.sleep(0.05)  # let the writer reach its queue wait
+    await reader.decode_queue.put(
+        audio_sink.DecodeJob(
+            generation=1,
+            file_path=str(tmp_path / "seg.wav"),
+            pos=(0, 0, 0),
+            timing_info={"word_timings": []},
+            requested_speed=1.0,
+            duration=0.5,
+        )
+    )
+
+    await asyncio.wait_for(writer, timeout=2.0)
+
+    assert sink.stdin.closed, "writer must close sink stdin when it crashes"
+    assert sink.terminated, "writer must terminate the sink so the supervisor restarts"

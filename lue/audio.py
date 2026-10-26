@@ -292,6 +292,22 @@ def _notify_console(reader, message: str) -> None:
         pass
 
 
+def _reset_sink_state(reader) -> None:
+    """Forget a sink generation so the highlight loop falls back to legacy.
+
+    Used when the persistent sink fails to start (missing ``ffplay``) or dies
+    during the startup health-check.  The failed sink's clock/table must not
+    survive: ``_word_update_loop`` selects the sink path from ``sink_clock``,
+    so leaving a stale clock would highlight the dead generation.
+    """
+    reader.sink = None
+    reader.sink_clock = None
+    table = getattr(reader, "segment_table", None)
+    if table is not None:
+        table.clear()
+    reader.segment_table = None
+
+
 async def _start_persistent(reader):
     """Spawn sink + writer + producer + supervisor for one generation."""
     # Cancel any lingering tasks from a previous (already-invalidated) generation.
@@ -322,7 +338,7 @@ async def _start_persistent(reader):
             f"[bold red]Audio sink failed to start: {exc}[/bold red]\n"
             "[yellow]Falling back to legacy audio.[/yellow]",
         )
-        reader.sink = None
+        _reset_sink_state(reader)
         await _start_legacy(reader)
         return
 
@@ -342,7 +358,14 @@ async def _start_persistent(reader):
             f"[bold red]Audio sink exited immediately (rc={rc}).[/bold red]\n"
             "[yellow]Falling back to legacy audio.[/yellow]",
         )
-        reader.sink = None
+        # The sink may have died before the writer was wired up; close the
+        # write end anyway so a failed spawn never leaks an fd (the process
+        # itself is already gone, so there is nothing left to reap).
+        try:
+            sink.close_stdin()
+        except Exception:  # noqa: BLE001 - cleanup must never mask the fallback
+            pass
+        _reset_sink_state(reader)
         await _start_legacy(reader)
         return
     reader.sink = sink

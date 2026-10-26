@@ -35,7 +35,7 @@ migration, a restart state machine, and a verification harness with real fixture
 | P0-3 | Speed/`atempo` placement missing; `audio.py:279-296`, `326-350`, `__main__.py:203-206` unclamped | §6 (Speed) | Resolved (decode-side chain order + clamp) |
 | P0-4 | Decode/resample/trim correctness; Kokoro WAV vs MP3; `duration is None` skip `audio.py:262-264` | §7 (Decode) | Resolved (exact cmd; no skip; byte-derived duration) |
 | P0-5 | Starvation/underrun + backpressure deadlock; `MAX_QUEUE_SIZE=4` items vs 64 KB pipe | §8 (Flow control) | Resolved (byte/ms bounds, silence-pad, drain timeouts) |
-| P1-1 | Overlap clamp contradiction (kokoro 0.6, gtts 0.1, default 0.4 vs [150,250] ms; `test_gtts_tts.py:56`) | §9.1, ADR-1 | Resolved (overlap removed; config + test migrated) |
+| P1-1 | Overlap clamp contradiction (kokoro 0.6, gtts 0.1, default 0.4 vs [150,250] ms; `tests/test_gtts_tts.py`) | §9.1, ADR-1 | Resolved (overlap removed; config + test migrated) |
 | P1-2 | `pkill` scoping too broad (`input_handler.py:296-307`) | §9.2 | Resolved (PID kill; tagged fallback) |
 | P1-3 | Pause overshoot | §9.3 | Resolved (clock-snapshot resume; no sleeps) |
 | P1-4 | Temp file lifecycle | §9.4 | Resolved (per-generation session dir; delete-after-decode) |
@@ -47,7 +47,7 @@ migration, a restart state machine, and a verification harness with real fixture
 | **G4** | `reader.py:689-718` speed range 1.0–3.0 not migrated | **§6.3**, §13 | Resolved (`SPEED_MIN/MAX = 0.5/4.0`) |
 | G5a | "cancel all decoder tasks" ambiguous (decoder inline?) | **§5.2 step 4** | Resolved (decoders run inline in `writer_task`) |
 | G5b | `--over` handling unspecified | **§12**, §13 | Resolved (argparse coerces; value ignored) |
-| G5c | CapCut fixture may be unavailable | **§14.1** | Resolved (optional; test skips when absent) |
+| G5c | CapCut fixture may be unavailable (the provider source, `lue/tts/capcut_tts.py`, exists on this branch) | **§14.1** | Resolved (fixture optional; test skips when absent) |
 | G5d | `t_audible` source ambiguous | **§4.5**, **§14.2** | Resolved (normative fake-sink output) |
 
 ---
@@ -108,7 +108,8 @@ migration, a restart state machine, and a verification harness with real fixture
    └─ await sink.wait(); on EOF+close → playback_finished_event.set()
 ```
 
-Removed: rotating `AUDIO_BUFFERS` per-sentence `ffplay`, per-item `asyncio.sleep`,
+Retired from the default sink path (kept for the legacy per-file path, §9.5):
+rotating `AUDIO_BUFFERS` per-sentence `ffplay`, per-item `asyncio.sleep`,
 `active_playback_tasks`, `playback_processes` population, `_new_sentence_started`
 as a wall-clock anchor.
 
@@ -140,7 +141,7 @@ Added modules:
 **Exact argv (normative; only `<title>` is substituted):**
 
 ```
-ffplay -nodisp -autoexit -loglevel error -window_title lue-audio-sink-<pid>-<gen> -f s16le -ar 48000 -ac 2 -i pipe:0
+ffplay -nodisp -autoexit -loglevel error -window_title lue-audio-sink-<pid>-<gen> -f s16le -ar 48000 -ch_layout stereo -i pipe:0
 ```
 
 - `<pid>` = `os.getpid()` of the **lue** process (known *before* spawn — not the
@@ -152,8 +153,9 @@ ffplay -nodisp -autoexit -loglevel error -window_title lue-audio-sink-<pid>-<gen
   - `-window_title lue-audio-sink-<pid>-<gen>` — the app-scoped tag used **only** by
     the fallback `pkill -f 'lue-audio-sink-'` (§9.2). It appears as an argv token, so
     `pkill -f` matches it even though `-nodisp` shows no window.
-  - `-f s16le -ar 48000 -ac 2` — declare the raw PCM format applied to the following
-    input; the writer **must** emit exactly this (I4).
+  - `-f s16le -ar 48000 -ch_layout stereo` — declare the raw PCM format applied to
+    the following input; the writer **must** emit exactly this (I4). `-ch_layout
+    stereo` replaces the legacy `-ac 2`, which was removed in ffmpeg n9.0.2.
   - `-i pipe:0` — read media from the child's **stdin** (fd 0).
   - **No `-af`** — all speed/format processing is decode-side (§6); the sink is
     tempo-agnostic (ADR-2). Do not add per-playback `-af` back.
@@ -167,7 +169,7 @@ ffplay -nodisp -autoexit -loglevel error -window_title lue-audio-sink-<pid>-<gen
 proc = await asyncio.create_subprocess_exec(
     "ffplay", "-nodisp", "-autoexit", "-loglevel", "error",
     "-window_title", f"lue-audio-sink-{os.getpid()}-{gen}",
-    "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+    "-f", "s16le", "-ar", "48000", "-ch_layout", "stereo", "-i", "pipe:0",
     stdin=asyncio.subprocess.PIPE,           # child fd0 = pipe read end
     stdout=asyncio.subprocess.DEVNULL,
     stderr=asyncio.subprocess.DEVNULL,
@@ -439,8 +441,11 @@ per-file `ffplay -af atempo...` (`audio.py:279-296`) is removed. The sink argv h
 
 ### 6.2 Filter chain (exact order, exact string)
 ```
--filter:a "<atempo_chain>,aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo"
+-filter:a "<atempo_chain>aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo"
 ```
+- `<atempo_chain>` already ends with a comma when non-empty and is the empty string
+  at speed 1.0, so the concatenation yields a valid filtergraph (no leading/double
+  comma); this is the same template as §7.2.
 - `atempo` first (source sample-rate domain; preserves pitch), then `aresample`
   (to sink rate, band-limited), then `aformat` (s16 + stereo).
 - `atempo_chain` construction (speed `s` already clamped):
@@ -493,8 +498,8 @@ the clamped speed.
 | kokoro | `wav` | 24000 Hz mono | `soundfile` write, PCM |
 | edge | `mp3` | ~24000 Hz mono | MP3 has encoder delay/padding |
 | openai | `mp3` | 24000 Hz mono | `response_format="mp3"` |
-| gtts | `mp3` | ~24000 Hz mono | MP3 |
-| capcut | `mp3` | unknown | validated by `_looks_like_mp3`; **optional** provider (§14.1) |
+| gtts | `mp3` | ~24000 Hz mono | MP3 (`lue/tts/gtts_tts.py`) |
+| capcut | `mp3` | unknown | validated by `_looks_like_mp3` in `lue/tts/capcut_tts.py`; source provider exists on this branch, only its audio fixture is optional (§14.1) |
 
 The decoder must accept both WAV and MP3 and arbitrary source rates.
 
@@ -505,7 +510,7 @@ ffmpeg -nostdin -hide_banner -loglevel error \
   -filter:a "<atempo_chain>aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo" \
     # <atempo_chain> already ends in a comma when non-empty, and is the empty
     # string at speed 1.0, so the concatenation yields a valid filtergraph.
-  -ar 48000 -ac 2 -f s16le pipe:1
+  -ar 48000 -ch_layout stereo -f s16le pipe:1
 ```
 - `-nostdin` **on ffmpeg** (the decoder): never let ffmpeg read the application's
   terminal stdin. (Contrast §3.1: ffplay must *not* get `-nostdin`, because it uses
@@ -603,10 +608,9 @@ ffmpeg -nostdin -hide_banner -loglevel error \
   (silence inserted between sentences; default 0). `TTS_OVERLAP_SECONDS`
   (`config.py:27-30`, kokoro 0.6 / gtts 0.1) is deprecated and ignored; a one-time
   `WARNING` is logged if non-empty.
-- `TTSBase.get_overlap_seconds` (`base.py:178-187`) returns `None`; `GTTTTS.get_overlap_seconds`
-  (`gtts_tts.py:64-66`) returns `None`.
-- `tests/test_gtts_tts.py:56` (`assert == 0.1`) is updated to assert `is None`
-  (and a new test asserts the deprecation warning).
+- `TTSBase.get_overlap_seconds` (`lue/tts/base.py`) returns `None`;
+  `GTTTS.get_overlap_seconds` (`lue/tts/gtts_tts.py`) returns `None`.
+- `tests/test_gtts_tts.py` asserts `is None` (and a new test asserts the deprecation warning).
 - No clamp range `[150,250] ms` exists in v3; this removes the contradiction.
 
 ### 9.2 P1-2 / G3 — `pkill` scoping and `_kill_audio_immediately` thread-safety
@@ -780,12 +784,12 @@ builder.
 
 | File | Location | Change |
 |------|----------|--------|
-| `lue/audio.py` | `_producer_loop` 129-235 | Keep TTS generation; enqueue `DecodeJob` instead of `(file,dur,timing)`; byte/ms bound |
-| `lue/audio.py` | `_player_loop` 237-361 | **Delete**; replaced by `writer_task` + `player_task` supervisor in `audio_sink.py` |
-| `lue/audio.py` | atempo 275-296 | Move to decode-side ffmpeg chain (§6.2); **delete** ffplay `-af` |
-| `lue/audio.py` | overlap 326-350, `actual_duration` 347-350 | **Delete**; no per-sentence sleep; overlap removed |
+| `lue/audio.py` | `_producer_loop` (legacy) 129-235 | Sink path replaced by `_producer_loop_sink` (emits `DecodeJob`); the legacy producer is preserved behind `--legacy-audio` via `tts_pipeline.create_pipeline` (§9.5, D1 Strategy A) |
+| `lue/audio.py` | `_player_loop` 237-361 | **Keep for the legacy per-file path** (`_start_legacy`); the sink path uses `writer_task` + `player_task` supervisor in `audio_sink.py` |
+| `lue/audio.py` | atempo 275-296 | Keep for the legacy per-file `ffplay` path; the sink path moves speed to the decode-side chain (§6.2) and never passes `-af` to ffplay |
+| `lue/audio.py` | overlap 326-350, `actual_duration` 347-350 | Sink path: **delete** per-sentence sleep/overlap; legacy path keeps its serial full-duration pacing (§9.5) |
 | `lue/audio.py` | `stop_and_clear_audio` 41-94 | Replace with 10-step teardown (§5.2); remove `pkill` 66-69 |
-| `lue/audio.py` | `play_from_current_position` 107-127 | Spawn sink+writer+producer+supervisor; reset clock/table/event |
+| `lue/audio.py` | `play_from_current_position` 107-127 | Route to `_start_persistent` (default) or `_start_legacy` (`USE_PERSISTENT_SINK=False`); reset clock/table/event |
 | `lue/audio.py` | `get_audio_duration` 98-105 | Retain for logging/validation only |
 | `lue/reader.py` | `_initialize_state` 30-63 | Add `audio_generation`, `writer_task`, `sink`, `sink_clock`, `segment_table`, `decode_queue`, `_resume`; note retired fields |
 | `lue/reader.py` | `_word_update_loop` 1139-1233 | Rewrite to `SinkClock` + `SegmentTable`; advance position at audible onset |
@@ -800,10 +804,11 @@ builder.
 | `lue/input_handler.py` | `_kill_audio_immediately` 296-307 | PID kill + token bump only; thread-safe (no `pkill`/`subprocess.run`, no fd close) (§9.2, G3) |
 | `lue/config.py` | 104-109 | New sink/speed constants; deprecate overlap; `AUDIO_TMP_ROOT`; flag |
 | `lue/__main__.py` | 168-170, 200-206, 241-242, 310-312 | `--speed` clamp/validate; `--over` coerce-then-ignore (drop assignment at 241-242 and `overlap=` at 310); `--legacy-audio`, `--trim-silence` |
-| `lue/tts/base.py` | `get_overlap_seconds` 178-187 | Return `None` |
-| `lue/tts/gtts_tts.py` | `get_overlap_seconds` 64-66 | Return `None` |
+| `lue/tts/base.py` | `get_overlap_seconds` | Return `None` |
+| `lue/tts/gtts_tts.py` | `get_overlap_seconds` | Return `None` (provider exists on this branch) |
 | `lue/tts/kokoro_tts.py` | — | No change (uses config via base) |
-| `tests/test_gtts_tts.py` | line 56 | Assert `is None`; add deprecation-warning test |
+| `lue/tts/capcut_tts.py` | — | Provider exists on this branch; no overlap override beyond `TTSBase` |
+| `tests/test_gtts_tts.py` | `test_get_overlap_seconds` | Assert `is None`; deprecation-warning test |
 | `lue/audio_sink.py` | **NEW** | `SinkProcess` (launch per §3.1), `SinkClock`, `Segment`, `SegmentTable`, `writer_task` |
 | `lue/timing_calculator.py` | — | Unchanged; documented as source-domain |
 | `tests/fixtures/audio/*` | **NEW** | Real fixtures (§14) |
@@ -865,8 +870,8 @@ fixtures; network/key steps are manual/CI-gated; Kokoro fixtures are offline.
 | T12 resample/format | 44.1 kHz stereo WAV | sink receives 48 kHz stereo; duration within 1% |
 | T13 temp lifecycle | run + restart + shutdown | session dir created, files deleted after decode, dir gone after teardown; no `buffer_*` files |
 | T14 CLI validation | `--speed 0.2`, `--speed 5`, `--speed abc` | exit code 2 + message; `--speed 2.5` accepted |
-| T15 legacy flag | `LUE_PERSISTENT_SINK=0` | per-file path runs; shared teardown works |
-| T16 sink argv | fake `ffplay` shim records argv/stdio | argv exactly §3.1; stdin is a pipe; stdout/stderr devnull; **no `-af`, no `-nostdin`** |
+| T15 legacy flag | `LUE_PERSISTENT_SINK=0` | legacy per-file pipeline (`_start_legacy` / `tts_pipeline`) runs; shared teardown works |
+| T16 sink argv | fake `ffplay` shim records argv/stdio | argv exactly §3.1: `-ch_layout stereo`, no `-ac`; stdin is a pipe; stdout/stderr devnull; **no `-af`, no `-nostdin`** |
 | T17 speed grid | `_increase_speed`/`_decrease_speed` from 1.0 | can reach 0.5 and 4.0; never outside; restart only on change (G4) |
 | T18 kill thread-safety | call `_kill_audio_immediately` from a thread | token bumped, SIGKILL sent, no event-loop object touched; teardown closes fd cleanly (G3) |
 

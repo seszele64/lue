@@ -390,7 +390,10 @@ def cli():
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        pass
+        # argparse and the --speed range check exit via SystemExit(2).  The
+        # console-script wrapper must propagate that status instead of
+        # swallowing it (otherwise invalid CLI input looks like success).
+        raise
     except Exception as e:
         logging.critical(f"Fatal error in application startup: {e}", exc_info=True)
 

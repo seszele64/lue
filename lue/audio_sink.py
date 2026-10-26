@@ -545,8 +545,17 @@ async def writer_task(reader, gen: int) -> None:
                 raise
             started = True
             await _pace(table, clock)
-    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, SinkWriteError) as exc:
-        log.warning("Sink pipe closed / stalled (gen %s): %s", gen, exc)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - writer must fail closed
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, SinkWriteError)):
+            log.warning("Sink pipe closed / stalled (gen %s): %s", gen, exc)
+        else:
+            log.exception("Writer failed (gen %s): %s", gen, exc)
+        # A crash (e.g. FileNotFoundError spawning ffmpeg) must not leave the
+        # sink alive with an open stdin: the supervisor waits on sink.wait()
+        # forever, wedging playback.  Close the pipe and terminate the sink so
+        # the supervisor observes the exit and restarts the generation.
         try:
             sink.close_stdin()
         except Exception:  # noqa: BLE001
@@ -556,8 +565,6 @@ async def writer_task(reader, gen: int) -> None:
         except Exception:  # noqa: BLE001
             pass
         return
-    except asyncio.CancelledError:
-        raise
 
     if gen != reader.audio_generation:
         return
