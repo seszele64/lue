@@ -57,6 +57,7 @@ os.environ.update(
         "LUE_GTTS_LANG": "en",
         "LUE_GTTS_TLD": "com",
         "LUE_GTTS_SLOW": "false",
+        "LUE_GTTS_TIMEOUT": "5",
         # Suppress UI-related side effects.
         "LUE_SHOW_BUFFER_STATUS": "false",
         # Never let a test pick up a real provider credential.

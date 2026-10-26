@@ -14,13 +14,13 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",  # Default Edge voice
     "kokoro": "af_heart",         # Default Kokoro voice
     "openai": "alloy",            # Default OpenAI voice
-    "gtts": "en",                 # Default gTTS language code
+    "gtts": "en",                 # Default gTTS language code (or set LUE_GTTS_LANG)
 }
 
 # Language settings for TTS models
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # Language code for Kokoro TTS
-    "gtts": "en",   # Language code for Google Translate TTS
+    "gtts": "en",   # Fallback for TTS_VOICES["gtts"]
 }
 ```
 
@@ -723,11 +723,34 @@ For reference, a typical eBook chapter (5,000 words ≈ 30,000 characters) costs
 
 #### Languages
 
-gTTS is selected by language code rather than a named voice. Pass one with `--voice`/`--lang`, or change `TTS_VOICES["gtts"]` in `lue/config.py`. Examples: `en`, `en-uk`, `fr`, `de`, `es`, `it`, `ja`, `zh-CN`.
+gTTS is selected by a language code rather than a named voice. The value is resolved in this order — the first non-empty one wins:
+
+1. `--lang` (or `--voice`, which gTTS also treats as a language code)
+2. `LUE_GTTS_LANG` environment variable
+3. `TTS_VOICES["gtts"]` in `lue/config.py` (default: `en`) — the usual knob to change
+4. `TTS_LANGUAGE_CODES["gtts"]` in `lue/config.py` (fallback alias, default: `en`)
+
+Common codes: `en`, `fr`, `de`, `es`, `it`, `ja`, `zh-CN`. Deprecated regional tags such as `en-uk` are still accepted and fall back to `en`; for a British accent prefer `en` together with `LUE_GTTS_TLD=co.uk`.
 
 ```bash
+# Per-run override
 lue book.epub --tts gtts --lang fr
+
+# New default for every run
+LUE_GTTS_LANG=de lue book.epub --tts gtts
 ```
+
+Or edit the config default:
+
+```python
+# lue/config.py
+TTS_VOICES = {
+    ...
+    "gtts": "ja",  # Default gTTS language code
+}
+```
+
+An unsupported or malformed code is reported during startup and disables TTS for the session, rather than failing on every sentence.
 
 Optional environment variables:
 
@@ -735,7 +758,8 @@ Optional environment variables:
 | :--- | :--- | :--- |
 | `LUE_GTTS_TLD` | `com` | Top-level domain of the Google Translate endpoint (e.g. `us`, `co.uk`, `co.in`). |
 | `LUE_GTTS_SLOW` | `false` | Set to `true`/`1` for slower speech. |
-| `LUE_GTTS_LANG` | `en` | Default language code when none is given. |
+| `LUE_GTTS_LANG` | `en` | Default language code; overrides `TTS_VOICES["gtts"]`. |
+| `LUE_GTTS_TIMEOUT` | `30` | Per-request network timeout in seconds (floored at `5`). A timed-out sentence is retried by the audio producer. |
 
 #### Limitations
 

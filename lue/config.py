@@ -11,13 +11,13 @@ TTS_VOICES = {
     "edge": "en-US-JennyNeural",
     "kokoro": "af_heart",
     "openai": "alloy",
-    "gtts": "en",  # free Google Translate TTS language code
+    "gtts": "en",  # free Google Translate TTS: default language code
 }
 
 # Language codes for TTS models that require them
 TTS_LANGUAGE_CODES = {
     "kokoro": "a",  # a=English, e=Spanish, j=Japanese, etc.
-    "gtts": "en",  # BCP-47-ish language code for Google Translate TTS
+    "gtts": "en",  # fallback alias for TTS_VOICES["gtts"]
 }
 
 # TTS model-specific seconds of overlap between sentences (overrides default OVERLAP_SECONDS if specified)
@@ -28,7 +28,27 @@ TTS_OVERLAP_SECONDS = {
 # ── Free TTS providers (no API key required) ───────────────────────────────
 
 # gTTS (Google Translate TTS).
-GTTS_LANG = os.environ.get("LUE_GTTS_LANG", TTS_LANGUAGE_CODES["gtts"])
+
+
+def _resolve_gtts_lang(env_lang: str, voices: dict, codes: dict) -> str:
+    """Resolve the default gTTS language code.
+
+    Precedence: ``LUE_GTTS_LANG``, then ``TTS_VOICES["gtts"]`` (the knob
+    documented in VOICES.md), then ``TTS_LANGUAGE_CODES["gtts"]`` (fallback
+    alias).  ``--lang``/``--voice`` are applied later by the provider and take
+    priority over everything resolved here.
+    """
+    return (
+        (env_lang or "").strip()
+        or voices.get("gtts")
+        or codes.get("gtts")
+        or "en"
+    )
+
+
+GTTS_LANG = _resolve_gtts_lang(
+    os.environ.get("LUE_GTTS_LANG", ""), TTS_VOICES, TTS_LANGUAGE_CODES
+)
 GTTS_TLD = os.environ.get("LUE_GTTS_TLD", "com")
 GTTS_SLOW = os.environ.get("LUE_GTTS_SLOW", "false").strip().lower() in (
     "1",
@@ -36,6 +56,12 @@ GTTS_SLOW = os.environ.get("LUE_GTTS_SLOW", "false").strip().lower() in (
     "yes",
     "on",
 )
+
+# Per-request timeout (seconds) for the blocking gTTS network call.  The call
+# runs in a worker thread, so a hung request is abandoned instead of stalling
+# the audio producer; the producer's retry path then takes over.
+_gtts_timeout_raw = float(os.environ.get("LUE_GTTS_TIMEOUT", "30"))
+GTTS_TIMEOUT = max(_gtts_timeout_raw, 5.0) if _gtts_timeout_raw > 0 else 30.0
 
 # OpenAI TTS retry settings
 # Per-request generation timeout (seconds). Requests that exceed this
