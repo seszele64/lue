@@ -430,15 +430,45 @@ sink flushes and `-autoexit` can exit on EOF).
 | RESTARTING | PRIMING/IDLE | teardown done | if not paused: start |
 | any | IDLE | `_shutdown` | teardown; no restart |
 
+### 5.7 Restart budget and fail-open
+
+A sink that exits before `EOF_SENTINEL` is a real fault, so §5.2 restarts the
+generation.  Restarting is not free: every generation re-runs TTS for the
+sentences it reaches, so a permanent fault (wrong device, ffmpeg that always
+crashes) would loop kill→restart forever and burn CPU and provider quota.
+
+`_sink_supervisor` therefore consults a per-reader sliding-window budget before
+each restart (`audio._sink_restart_budget`):
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `SINK_RESTART_MAX` | `3` | attempts allowed inside one window |
+| `SINK_RESTART_WINDOW_S` | `60.0` | sliding window length |
+| `SINK_RESTART_BACKOFF_S` | `0.25` | first backoff, doubled per attempt |
+| `SINK_RESTART_BACKOFF_MAX_S` | `5.0` | backoff ceiling |
+
+- Backoff is `min(SINK_RESTART_BACKOFF_S * 2**attempt, SINK_RESTART_BACKOFF_MAX_S)`
+  and is awaited by `_restart_sink_with_backoff` before it touches the reader, so
+  a navigation during the wait cancels the restart instead of resurrecting a
+  dead generation (`gen` is re-checked after the sleep).
+- Exhausting the budget calls `_fail_open_to_legacy`, which sets the sticky
+  `reader.sink_disabled` flag, clears the dead generation's clock/table/cached
+  segment (§5.2), tells the user once, and restarts through the normal path.
+- `play_from_current_position` routes on
+  `config.USE_PERSISTENT_SINK and not reader.sink_disabled`, so the fallback
+  holds for the rest of the session even though the config flag stays true.
+  `_word_update_loop` applies the same guard to the highlight source.
+
 ---
 
 ## 6. P0-3 — Speed and `atempo`
 
 ### 6.1 Placement (decision)
 Apply speed **decode-side** in the per-sentence ffmpeg transcode, so the sink always
-receives nominal-rate PCM and needs no reconfiguration on speed change. The previous
-per-file `ffplay -af atempo...` (`audio.py:279-296`) is removed. The sink argv has no
-`-af` (§3.1).
+receives nominal-rate PCM and needs no reconfiguration on speed change. The sink argv
+has no `-af` (§3.1); only the *legacy* per-file path (`--legacy-audio`) still applies
+`atempo` in its per-sentence `ffplay` command (`audio.py`), which is why T15 keeps it
+working.
 
 ### 6.2 Filter chain (exact order, exact string)
 ```
@@ -610,7 +640,7 @@ ffmpeg -nostdin -hide_banner -loglevel error \
   (`config.py:27-30`, kokoro 0.6 / gtts 0.1) is deprecated and ignored; a one-time
   `WARNING` is logged if non-empty.
 - `TTSBase.get_overlap_seconds` (`lue/tts/base.py`) returns `None`;
-  `GTTTS.get_overlap_seconds` (`lue/tts/gtts_tts.py`) returns `None`.
+  `GTTTTS.get_overlap_seconds` (`lue/tts/gtts_tts.py`) returns `None`.
 - `tests/test_gtts_tts.py` asserts `is None` (and a new test asserts the deprecation warning).
 - No clamp range `[150,250] ms` exists in v3; this removes the contradiction.
 
@@ -879,7 +909,9 @@ fixtures; network/key steps are manual/CI-gated; Kokoro fixtures are offline.
 | T15 legacy flag | `LUE_PERSISTENT_SINK=0` | legacy per-file pipeline (`_start_legacy` / `tts_pipeline`) runs; shared teardown works |
 | T16 sink argv | fake `ffplay` shim records argv/stdio | argv exactly §3.1: `-ch_layout stereo`, no `-ac`; stdin is a pipe; stdout/stderr devnull; **no `-af`, no `-nostdin`** |
 | T17 speed grid | `_increase_speed`/`_decrease_speed` from 1.0 | can reach 0.5 and 4.0; never outside; restart only on change (G4) |
-| T18 kill thread-safety | call `_kill_audio_immediately` from a thread | token bumped, SIGKILL sent, no event-loop object touched; teardown closes fd cleanly (G3) |
+| T18 kill thread-safety | call `_kill_audio_immediately` from the stdin-reader callback (event-loop thread), plus a manual thread call | token bumped, SIGKILL sent, no `await`/StreamWriter close/process reap in the callback; the follow-up teardown closes fd and reaps cleanly (G3) |
+| T19 restart budget | sink that exits before EOF every generation | at most `SINK_RESTART_MAX` restarts per window with growing backoff, then `sink_disabled` is latched and later starts use `_start_legacy` (§5.7) |
+| T20 sink EOF watchdog | sink whose stdin drain and `wait()` both hang | writer returns within `SINK_EOF_TIMEOUT_S` + `SINK_TERM_TIMEOUT_S`; `terminate()` is called so `sink.wait()` returns and the supervisor can still set `playback_finished_event` |
 
 ### 14.4 CI process hygiene checks
 - Before/after each test: assert no `ffplay`/`ffmpeg` children of the test PID remain.

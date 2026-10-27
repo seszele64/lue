@@ -171,6 +171,14 @@ SINK_TERM_TIMEOUT_S = 0.5
 SINK_KILL_TIMEOUT_S = 0.2
 SINK_EOF_TIMEOUT_S = 3.0
 SINK_STARTUP_GRACE_S = 0.1  # health-check delay after ffplay spawn (§3.1)
+# Restart budget (§5.7): a sink that dies before EOF is restarted, but a
+# permanent ffmpeg/device fault must not loop kill→restart forever — every
+# generation re-runs TTS.  Give up after N restarts inside the window and fail
+# open to the legacy per-file pipeline; back off exponentially in between.
+SINK_RESTART_MAX = 3
+SINK_RESTART_WINDOW_S = 60.0
+SINK_RESTART_BACKOFF_S = 0.25
+SINK_RESTART_BACKOFF_MAX_S = 5.0
 WRITER_CHUNK_MS = 20  # 3840 B/chunk
 PCM_RING_MAX_MS = 2000  # 384000 B
 PCM_LOW_WATER_MS = 300

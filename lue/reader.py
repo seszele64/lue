@@ -11,7 +11,11 @@ import platformdirs
 
 from . import config, content_parser, progress_manager, audio, ui, input_handler, audio_sink
 from .tts.base import TTSBase
-from .timing_calculator import mapping_for_displayed_words, select_highlight_word
+from .timing_calculator import (
+    mapping_for_displayed_words,
+    owner_word_index,
+    select_highlight_word,
+)
 
 class Lue:
     def __init__(self, file_path, tts_model: TTSBase | None, overlap: float | None = None):
@@ -61,6 +65,10 @@ class Lue:
         self._session_dir = None
         self._sink_eof_intended = False
         self._resume = None
+        # Cached segment for the current highlight generation, and the sticky
+        # fail-open switch set by ``audio._fail_open_to_legacy``.
+        self._sink_seg = None
+        self.sink_disabled = False
 
         # TTS pipeline state
         self._pipeline_state = "IDLE"  # pipeline lifecycle state
@@ -1184,10 +1192,23 @@ class Lue:
             # sentence to seek into.  Resume at the sentence *after* the last
             # real segment instead of dropping the snapshot (which would
             # restart the current sentence and replay the pad).
-            base_pos = getattr(getattr(self, "_sink_seg", None), "pos", None)
+            #
+            # The cached segment is only trusted for the *current* generation:
+            # after a restart/book switch it still points at the old book's
+            # sentence, and advancing from that position would resume in the
+            # wrong place (or raise IndexError on a shorter book).
+            sink_seg = getattr(self, "_sink_seg", None)
+            base_pos = (
+                sink_seg.pos
+                if sink_seg is not None
+                and getattr(sink_seg, "generation", None) == self.audio_generation
+                else None
+            )
             if base_pos is None and table is not None:
                 for prior in reversed(table.segments):
-                    if not prior.is_silence and prior.pos is not None:
+                    if (not prior.is_silence
+                            and prior.pos is not None
+                            and prior.generation == self.audio_generation):
                         base_pos = prior.pos
                         break
             if base_pos is None:
@@ -1226,7 +1247,15 @@ class Lue:
                 # (``audio._producer_loop_sink``).  Wiping it here would make
                 # every resume restart at the sentence start.
                 if self.is_paused:
-                    self._resume = self._snapshot_resume_position()
+                    # A second pause can land while the resumed generation is
+                    # still buffering, where the clock has no segment yet and
+                    # the snapshot is legitimately ``None``.  That must not
+                    # wipe a valid snapshot from the first pause: it has not
+                    # been consumed by a producer yet, so it is still the best
+                    # resume point.
+                    snapshot = self._snapshot_resume_position()
+                    if snapshot is not None:
+                        self._resume = snapshot
 
                 # Stop current audio playback.  ``preserve_resume`` keeps the
                 # pause snapshot across teardown; navigation/shutdown callers
@@ -1297,7 +1326,9 @@ class Lue:
         while self.running:
             try:
                 if not self.is_paused:
-                    if self.sink_clock is not None and config.USE_PERSISTENT_SINK:
+                    if (self.sink_clock is not None
+                            and config.USE_PERSISTENT_SINK
+                            and not self.sink_disabled):
                         self._update_highlight_from_sink()
                     else:
                         self._update_highlight_legacy()
@@ -1363,6 +1394,15 @@ class Lue:
                         sub = max(0, min(int((local_src - start) / per), len(mapped) - 1))
                         return min(mapped[sub], total_words - 1)
                     return min(mapped[-1], total_words - 1)
+                # No displayed token owns this spoken word on its own:
+                # ``sanitize_text_for_tts`` splits hyphen-/dash-joined tokens
+                # ("word-another", "past—it") into several spoken words and
+                # only the first carries the token's mapping entry.  Indexing
+                # the displayed list with the spoken index drifts one word
+                # ahead per joined token, so stay on the owning token — the
+                # same guard ``select_highlight_word`` applies on the legacy
+                # path.
+                return min(owner_word_index(mapping, tts_idx), total_words - 1)
             return min(tts_idx, total_words - 1)
 
         # No word timings: equal split over the source (or output) duration.

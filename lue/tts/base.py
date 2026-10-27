@@ -20,13 +20,15 @@ def warn_overlap_deprecated() -> None:
 
     Playback behaviour therefore *does* change for providers that used to have
     an override, and ``TTS_OVERLAP_SECONDS`` is now dead configuration.  The
-    legacy per-file path keeps applying ``config.OVERLAP_SECONDS`` (default
-    ``0.0`` in this branch, overridable with ``--over``), scaled down as the
-    playback speed approaches ``3.0x``; a provider that previously lowered or
-    raised the overlap through ``TTS_OVERLAP_SECONDS`` silently falls through to
-    that global default.  Concretely, Kokoro's ``0.6`` entry no longer applies —
-    a small, accepted regression until gapless playback (spec-v3, see the
-    gapless-persistent-sink PR) takes over overlap scheduling entirely.
+    legacy per-file path is strictly serial and applies **no** overlap at all:
+    ``config.OVERLAP_SECONDS`` is only a deprecated alias of
+    ``SENTENCE_GAP_SECONDS`` (``0.0``) and is not read by the player, and
+    ``--over`` is still accepted but ignored with a warning.  A provider that
+    previously lowered or raised the overlap through ``TTS_OVERLAP_SECONDS``
+    silently falls through to that zero default.  Concretely, Kokoro's ``0.6``
+    entry no longer applies — a small, accepted regression until gapless
+    playback (spec-v3, see the gapless-persistent-sink PR) takes over overlap
+    scheduling entirely.
     """
     global _overlap_warned
     if _overlap_warned:

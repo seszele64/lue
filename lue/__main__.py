@@ -399,11 +399,16 @@ def cli():
     """Synchronous entry point for the command-line interface."""
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except SystemExit:
         # argparse and the --speed range check exit via SystemExit(2).  The
         # console-script wrapper must propagate that status instead of
         # swallowing it (otherwise invalid CLI input looks like success).
         raise
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal user exit: no traceback and no "fatal error" log.
+        # 130 is the shell convention for a SIGINT-terminated process; the
+        # terminal state was already restored by main()'s finally block.
+        raise SystemExit(130) from None
     except Exception as e:
         logging.critical(f"Fatal error in application startup: {e}", exc_info=True)
 

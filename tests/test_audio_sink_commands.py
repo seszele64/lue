@@ -19,6 +19,7 @@ import pytest
 from lue import audio, audio_sink, config
 from lue import __main__ as cli_main
 from lue.reader import Lue
+from lue.timing_calculator import select_highlight_word
 
 
 # ── build_decode_command / build_decode_filter ─────────────────────────────
@@ -685,7 +686,9 @@ def test_word_index_clamps_before_first_timing():
 
 
 def _resume_reader(chapters):
-    reader = SimpleNamespace(chapters=chapters, _sink_seg=None)
+    reader = SimpleNamespace(
+        chapters=chapters, _sink_seg=None, audio_generation=1
+    )
     reader._advance_position = MethodType(Lue._advance_position, reader)
     return reader
 
@@ -818,3 +821,354 @@ async def test_writer_fails_closed_when_decoder_spawn_fails(monkeypatch, tmp_pat
 
     assert sink.stdin.closed, "writer must close sink stdin when it crashes"
     assert sink.terminated, "writer must terminate the sink so the supervisor restarts"
+
+
+# ── W2b: restart budget, backoff and fail-open routing ─────────────────────
+
+
+def _budget_reader() -> SimpleNamespace:
+    return SimpleNamespace(_sink_restart_times=[])
+
+
+def test_restart_budget_allows_max_attempts_then_fails_open():
+    """A permanently broken sink may be restarted ``SINK_RESTART_MAX`` times."""
+    reader = _budget_reader()
+    results = [
+        audio._sink_restart_budget(reader)
+        for _ in range(config.SINK_RESTART_MAX)
+    ]
+
+    assert all(allowed for allowed, _ in results)
+    expected = [
+        min(config.SINK_RESTART_BACKOFF_S * (2 ** attempt),
+            config.SINK_RESTART_BACKOFF_MAX_S)
+        for attempt in range(config.SINK_RESTART_MAX)
+    ]
+    assert [delay for _, delay in results] == pytest.approx(expected)
+
+    allowed, delay = audio._sink_restart_budget(reader)
+    assert allowed is False, "4th restart inside the window must fail open"
+    assert delay == 0.0
+
+
+def test_restart_budget_window_expiry_frees_attempts(monkeypatch):
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(
+        audio, "time", SimpleNamespace(monotonic=lambda: clock["now"])
+    )
+    reader = _budget_reader()
+
+    for _ in range(config.SINK_RESTART_MAX):
+        assert audio._sink_restart_budget(reader)[0] is True
+    assert audio._sink_restart_budget(reader)[0] is False
+
+    # Past the sliding window the old attempts no longer count.
+    clock["now"] += config.SINK_RESTART_WINDOW_S + 1.0
+    assert audio._sink_restart_budget(reader)[0] is True
+
+
+def test_restart_budget_backoff_is_capped(monkeypatch):
+    monkeypatch.setattr(config, "SINK_RESTART_MAX", 6)
+    monkeypatch.setattr(config, "SINK_RESTART_BACKOFF_MAX_S", 1.0)
+    reader = _budget_reader()
+
+    delays = [audio._sink_restart_budget(reader)[1] for _ in range(6)]
+    assert delays[-1] == 1.0
+    assert all(delay <= 1.0 for delay in delays)
+
+
+async def test_fail_open_disables_sink_and_routes_later_starts_to_legacy(monkeypatch):
+    """``_fail_open_to_legacy`` must actually change the routing decision."""
+    starts: list[str] = []
+
+    async def fake_persistent(reader):  # noqa: ARG001
+        starts.append("persistent")
+
+    async def fake_legacy(reader):  # noqa: ARG001
+        starts.append("legacy")
+
+    async def fake_restart():
+        starts.append("restart")
+
+    monkeypatch.setattr(audio, "_start_persistent", fake_persistent)
+    monkeypatch.setattr(audio, "_start_legacy", fake_legacy)
+    monkeypatch.setattr(config, "USE_PERSISTENT_SINK", True)
+
+    reader = SimpleNamespace(
+        is_paused=False,
+        running=True,
+        tts_model=object(),
+        sink_disabled=False,
+        sink=None,
+        sink_clock=object(),
+        segment_table=audio_sink.SegmentTable(),
+        _sink_seg=object(),
+        pending_restart_task=None,
+        console=None,
+        _restart_audio_after_navigation=fake_restart,
+    )
+
+    await audio.play_from_current_position(reader)
+    assert starts == ["persistent"]
+    assert reader.sink_disabled is False
+
+    audio._fail_open_to_legacy(reader)
+
+    assert reader.sink_disabled is True, "fail-open must latch the legacy path"
+    assert reader.sink_clock is None and reader.sink is None
+    assert reader._sink_seg is None
+
+    await asyncio.wait_for(reader.pending_restart_task, timeout=1.0)
+    assert starts == ["persistent", "restart"]
+
+    # Even with USE_PERSISTENT_SINK still true, the next start is legacy.
+    await audio.play_from_current_position(reader)
+    assert starts == ["persistent", "restart", "legacy"]
+
+
+def test_sink_disabled_reader_defaults_to_legacy_route(monkeypatch):
+    """A reader with no ``sink_disabled`` attribute must still not crash."""
+    calls: list[str] = []
+
+    async def fake_persistent(reader):  # noqa: ARG001
+        calls.append("persistent")
+
+    async def fake_legacy(reader):  # noqa: ARG001
+        calls.append("legacy")
+
+    monkeypatch.setattr(audio, "_start_persistent", fake_persistent)
+    monkeypatch.setattr(audio, "_start_legacy", fake_legacy)
+    monkeypatch.setattr(config, "USE_PERSISTENT_SINK", True)
+
+    reader = SimpleNamespace(is_paused=False, running=True, tts_model=object())
+    asyncio.run(audio.play_from_current_position(reader))
+    assert calls == ["persistent"]
+
+
+# ── W3b: a stuck sink is terminated after EOF (no supervisor hang) ─────────
+
+
+class _HangingStdin:
+    closed = False
+
+    def write(self, data):  # noqa: ARG002
+        pass
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        await asyncio.Event().wait()  # never drains
+
+
+class _StuckSink:
+    """ffplay that stops reading stdin: drain and exit both hang."""
+
+    def __init__(self):
+        self.stdin = _HangingStdin()
+        self.terminated = False
+
+    def close_stdin(self):
+        self.stdin.closed = True
+
+    async def wait(self):
+        await asyncio.Event().wait()
+
+    async def terminate(self):
+        self.terminated = True
+
+
+async def test_writer_terminates_sink_when_eof_drain_and_exit_hang(monkeypatch):
+    monkeypatch.setattr(config, "SINK_EOF_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(config, "SINK_TERM_TIMEOUT_S", 0.05)
+
+    sink = _StuckSink()
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(audio_sink.EOF_SENTINEL)
+    reader = SimpleNamespace(
+        audio_generation=1,
+        sink=sink,
+        sink_clock=audio_sink.SinkClock(),
+        segment_table=audio_sink.SegmentTable(),
+        decode_queue=queue,
+        _sink_eof_intended=False,
+    )
+
+    await asyncio.wait_for(audio_sink.writer_task(reader, 1), timeout=2.0)
+
+    assert sink.stdin.closed, "writer must close stdin on EOF"
+    assert sink.terminated, "a sink that never exits must be terminated"
+    assert reader._sink_eof_intended is True
+
+
+# ── W1: sink highlight must survive hyphen-split word mapping ─────────────
+
+
+def test_sink_word_index_stays_on_hyphenated_token():
+    """``well-known`` is one displayed token but two spoken words."""
+    reader = SimpleNamespace(
+        current_sentence_words=["Alpha", "well-known", "beta"]
+    )
+    seg = audio_sink.Segment(
+        generation=1,
+        pos=(0, 0, 0),
+        out_start=0.0,
+        src_duration=4.0,
+        word_timings=[
+            ("alpha", 0.0, 1.0),
+            ("well", 1.0, 2.0),
+            ("known", 2.0, 3.0),
+            ("beta", 3.0, 4.0),
+        ],
+        # Only the first spoken word of each token carries its entry.
+        word_mapping=[0, 1, 3],
+    )
+
+    # 2.5 s is inside "known" (spoken idx 2), which no token owns directly.
+    assert Lue._word_index_for_segment(reader, seg, 2.5, 2.5) == 1
+
+    # The legacy selector agrees, so both paths highlight the same token.
+    assert select_highlight_word(
+        word_timings=seg.word_timings,
+        word_mapping=seg.word_mapping,
+        elapsed=2.5,
+        total_words=3,
+    ) == 1
+
+
+# ── S4: the cached highlight segment is generation-scoped ─────────────────
+
+
+async def test_snapshot_ignores_sink_seg_from_previous_generation():
+    table = audio_sink.SegmentTable()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=2, pos=None, out_start=0.0,
+            out_duration=0.5, is_silence=True,
+        )
+    )
+
+    reader = _resume_reader([["Only sentence."]])
+    reader.audio_generation = 2
+    # Cached while the previous generation played: position (9, 0, 0) does
+    # not even exist in this book, so using it would raise IndexError.
+    reader._sink_seg = audio_sink.Segment(
+        generation=1, pos=(9, 0, 0), out_start=0.0, out_duration=1.0,
+    )
+    reader.sink_clock = _StaticClock(0.1)
+    reader.segment_table = table
+
+    assert Lue._snapshot_resume_position(reader) is None
+
+
+async def test_snapshot_uses_current_generation_sink_seg():
+    table = audio_sink.SegmentTable()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=2, pos=(0, 0, 0), out_start=0.0,
+            out_duration=2.0, src_duration=2.0,
+        )
+    )
+    table.close_segment()
+    table.open_segment(
+        audio_sink.Segment(
+            generation=2, pos=None, out_start=2.0,
+            out_duration=0.5, is_silence=True,
+        )
+    )
+
+    reader = _resume_reader([["First. Second."]])
+    reader.audio_generation = 2
+    reader._sink_seg = audio_sink.Segment(
+        generation=2, pos=(0, 0, 0), out_start=0.0, out_duration=2.0,
+    )
+    reader.sink_clock = _StaticClock(2.1)
+    reader.segment_table = table
+
+    assert Lue._snapshot_resume_position(reader) == ((0, 0, 1), 0.0)
+
+
+async def test_teardown_and_consume_reset_cached_sink_seg(monkeypatch, tmp_path):
+    seg = audio_sink.Segment(
+        generation=1, pos=(0, 0, 0), out_start=0.0, out_duration=1.0,
+    )
+
+    # Book switch / navigation / pause teardown.
+    reader = _stoppable_reader()
+    reader._sink_seg = seg
+    await audio.stop_and_clear_audio(reader)
+    assert reader._sink_seg is None, "teardown must drop the cached segment"
+
+    # Producer consuming a resume snapshot.
+    async def fake_duration(path):  # noqa: ARG001
+        return 0.5
+
+    monkeypatch.setattr(audio, "get_audio_duration", fake_duration)
+    reader = SimpleNamespace(
+        tts_model=_FakeTimingTTS(),
+        audio_generation=1,
+        running=True,
+        chapters=[["Alpha. Beta."]],
+        chapter_idx=0,
+        paragraph_idx=0,
+        sentence_idx=0,
+        decode_queue=asyncio.Queue(maxsize=4),
+        _resume=((0, 0, 1), 0.5),
+        _sink_seg=seg,
+        _session_dir=str(tmp_path),
+        playback_speed=1.0,
+    )
+    reader._advance_position = MethodType(Lue._advance_position, reader)
+
+    await asyncio.wait_for(audio._producer_loop_sink(reader, 1), timeout=5.0)
+    assert reader._sink_seg is None, "consuming the snapshot starts a new generation"
+
+
+# ── S5: a second pause while buffering keeps the valid snapshot ────────────
+
+
+async def test_second_pause_while_buffering_keeps_valid_snapshot(monkeypatch):
+    async def fake_stop(reader, *, preserve_resume=False):
+        if not preserve_resume:
+            reader._resume = None
+
+    async def fake_play(reader):  # noqa: ARG001
+        pass
+
+    monkeypatch.setattr(audio, "stop_and_clear_audio", fake_stop)
+    monkeypatch.setattr(audio, "play_from_current_position", fake_play)
+
+    reader = _pause_reader()
+    valid = ((0, 0, 1), 3.27)
+    reader._resume = valid
+    reader.sink_clock = None
+    reader.segment_table = None
+    # Buffering: the resumed generation has no segment on the clock yet, so
+    # the snapshot is legitimately None.
+    reader._snapshot_resume_position = lambda: None
+
+    reader.is_paused = True
+    await Lue._handle_pause_toggle(reader)
+
+    assert reader._resume == valid, "a buffering pause must not wipe the snapshot"
+
+
+# ── S6: Ctrl-C is a clean exit, not a fatal startup error ─────────────────
+
+
+def test_cli_converts_keyboard_interrupt_to_exit_130(monkeypatch, caplog):
+    def fake_run(coro):
+        coro.close()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_main.asyncio, "run", fake_run)
+
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(SystemExit) as excinfo:
+            cli_main.cli()
+
+    assert excinfo.value.code == 130
+    assert "Fatal error" not in caplog.text, "Ctrl-C must not log a fatal error"

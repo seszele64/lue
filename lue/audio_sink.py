@@ -594,10 +594,44 @@ async def writer_task(reader, gen: int) -> None:
         sink.close_stdin()
     except Exception:  # noqa: BLE001
         pass
-    try:
-        await asyncio.wait_for(sink.stdin.wait_closed(), timeout=config.SINK_EOF_TIMEOUT_S)
-    except Exception:  # noqa: BLE001
-        pass
+
+    # Drain + exit are both time-bounded: ffplay that stops reading stdin
+    # (permanent device/decoder fault) must not leave the supervisor waiting
+    # on ``sink.wait()`` forever.  On timeout escalate SIGTERM → SIGKILL so
+    # the process exits and ``playback_finished_event`` is still set.
+    stdin = sink.stdin
+    drained = True
+    if stdin is not None:
+        try:
+            await asyncio.wait_for(
+                stdin.wait_closed(), timeout=config.SINK_EOF_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            drained = False
+            log.warning(
+                "Sink did not drain stdin within %.1fs of EOF (gen %s)",
+                config.SINK_EOF_TIMEOUT_S, gen,
+            )
+        except Exception:  # noqa: BLE001 - already-closed / broken pipe
+            pass
+
+    wait = getattr(sink, "wait", None)
+    if wait is not None:
+        timeout = (
+            config.SINK_EOF_TIMEOUT_S if drained else config.SINK_TERM_TIMEOUT_S
+        )
+        try:
+            await asyncio.wait_for(wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Sink did not exit after EOF (gen %s); terminating", gen
+            )
+            try:
+                await sink.terminate()
+            except Exception:  # noqa: BLE001 - teardown must never raise
+                pass
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ── Temp session dirs (§9.4) ───────────────────────────────────────────────

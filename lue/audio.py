@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import logging
+import time
 
 from . import config, content_parser, audio_sink
 from .tts_pipeline import create_pipeline
@@ -258,6 +259,9 @@ async def stop_and_clear_audio(reader, *, preserve_resume: bool = False):
     reader.playback_finished_event.clear()
     reader._sink_eof_intended = False
     reader._current_decoder = None
+    # Book switch / navigation / pause teardown: the cached highlight segment
+    # belongs to the torn-down generation.
+    reader._sink_seg = None
 
     # A pause snapshot is handed to the next producer; everything else
     # invalidates it (see the docstring).
@@ -269,7 +273,12 @@ async def stop_and_clear_audio(reader, *, preserve_resume: bool = False):
 
 
 async def get_audio_duration(file_path):
-    """Get the duration of an audio file (logging / validation only, §7.4)."""
+    """Return ``file_path``'s duration in seconds via ffprobe, or ``None``.
+
+    Used for pacing/segment metadata (spec-v3 §7.4) — never as a gate: a
+    ``None`` result must not drop a sentence.  ffprobe failures and
+    unparseable output both return ``None`` instead of raising.
+    """
     command = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
     process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     stdout, _ = await process.communicate()
@@ -282,10 +291,17 @@ async def get_audio_duration(file_path):
 
 
 async def play_from_current_position(reader):
-    """Start audio playback, routing to the active pipeline (§9.5)."""
+    """Start audio playback, routing to the active pipeline (§9.5).
+
+    ``reader.sink_disabled`` is the sticky fail-open switch set by
+    :func:`_fail_open_to_legacy` once the restart budget is exhausted: the
+    session then stays on the legacy path even though
+    ``config.USE_PERSISTENT_SINK`` is still true.  Both are checked so the
+    fallback can never be a silent no-op.
+    """
     if reader.is_paused or not reader.running or not reader.tts_model:
         return
-    if config.USE_PERSISTENT_SINK:
+    if config.USE_PERSISTENT_SINK and not getattr(reader, "sink_disabled", False):
         await _start_persistent(reader)
     else:
         await _start_legacy(reader)
@@ -316,6 +332,9 @@ def _reset_sink_state(reader) -> None:
     if table is not None:
         table.clear()
     reader.segment_table = None
+    # The cached segment belongs to the dead generation; a stale ``pos`` must
+    # not seed a pause snapshot (``_snapshot_resume_position``).
+    reader._sink_seg = None
 
 
 async def _start_persistent(reader):
@@ -330,6 +349,9 @@ async def _start_persistent(reader):
 
     reader.playback_finished_event.clear()
     reader._sink_eof_intended = False
+    # New generation: the previous generation's cached highlight segment must
+    # not survive (``_snapshot_resume_position`` reads it as a fallback).
+    reader._sink_seg = None
 
     gen = reader.audio_generation
     reader.sink_clock = audio_sink.SinkClock()
@@ -455,10 +477,80 @@ async def _sink_supervisor(reader, gen):
     if not reader._sink_eof_intended:
         logging.warning("Audio sink exited before EOF (gen %s); scheduling restart", gen)
         if reader.running and not reader.is_paused:
-            reader.pending_restart_task = asyncio.create_task(
-                reader._restart_audio_after_navigation()
-            )
+            allowed, delay = _sink_restart_budget(reader)
+            if allowed:
+                reader.pending_restart_task = asyncio.create_task(
+                    _restart_sink_with_backoff(reader, gen, delay)
+                )
+            else:
+                _fail_open_to_legacy(reader)
     reader.playback_finished_event.set()
+
+
+def _sink_restart_budget(reader) -> tuple[bool, float]:
+    """Record one restart attempt; return ``(allowed, backoff_seconds)``.
+
+    A permanently broken sink (bad device, crashing ffmpeg) exits again right
+    after every restart, and each generation re-runs TTS for the sentences it
+    gets through.  Cap the attempts inside a sliding window so a hard fault
+    costs at most ``SINK_RESTART_MAX`` generations, and back off exponentially
+    between them instead of restarting immediately.
+    """
+    now = time.monotonic()
+    times = [
+        t for t in getattr(reader, "_sink_restart_times", [])
+        if now - t < config.SINK_RESTART_WINDOW_S
+    ]
+    if len(times) >= config.SINK_RESTART_MAX:
+        reader._sink_restart_times = times
+        return False, 0.0
+    times.append(now)
+    reader._sink_restart_times = times
+    attempt = len(times) - 1
+    delay = min(
+        config.SINK_RESTART_BACKOFF_S * (2 ** attempt),
+        config.SINK_RESTART_BACKOFF_MAX_S,
+    )
+    return True, delay
+
+
+async def _restart_sink_with_backoff(reader, gen: int, delay: float) -> None:
+    """Back off, then restart the generation via the reader's restart path."""
+    try:
+        if delay > 0:
+            await asyncio.sleep(delay)
+        if gen != reader.audio_generation or not reader.running or reader.is_paused:
+            return
+        await reader._restart_audio_after_navigation()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a restart failure must not kill the UI
+        logging.error("Sink restart failed (gen %s): %s", gen, exc)
+
+
+def _fail_open_to_legacy(reader) -> None:
+    """Stop retrying a permanently broken sink; keep playing on the legacy path.
+
+    The restart budget is exhausted, so further generations would only burn
+    TTS.  Mark the sink disabled for the rest of the session — this is sticky
+    and read by ``play_from_current_position``, which then routes every later
+    start to ``_start_legacy`` — and restart once through the normal path.
+    """
+    logging.error(
+        "Persistent audio sink failed %d times in %.0fs; falling back to legacy audio",
+        config.SINK_RESTART_MAX, config.SINK_RESTART_WINDOW_S,
+    )
+    reader.sink_disabled = True
+    _reset_sink_state(reader)
+    _notify_console(
+        reader,
+        "[bold red]Persistent audio sink keeps failing.[/bold red]\n"
+        "[yellow]Falling back to legacy audio for the rest of this session.[/yellow]",
+    )
+    if reader.running and not reader.is_paused:
+        reader.pending_restart_task = asyncio.create_task(
+            reader._restart_audio_after_navigation()
+        )
 
 
 # ── Persistent producer (§13) ──────────────────────────────────────────────
@@ -490,6 +582,9 @@ async def _producer_loop_sink(reader, gen):
 
     resume = reader._resume
     reader._resume = None
+    # Consuming the snapshot starts a fresh generation's highlight: drop the
+    # segment cached for the paused one.
+    reader._sink_seg = None
     if resume:
         producer_pos = resume[0]
         resume_src = float(resume[1] or 0.0)
