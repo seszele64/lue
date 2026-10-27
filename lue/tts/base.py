@@ -9,9 +9,10 @@ _overlap_warned = False
 
 
 def warn_overlap_deprecated() -> None:
-    """Log a single deprecation warning for the superseded overlap API (spec-v3 §9.1).
+    """Log a single deprecation warning for the removed overlap feature (spec-v3 §9.1).
 
-    Per-provider crossfade/overlap overrides are no longer honoured: providers
+    Crossfade/overlap was replaced by the gapless persistent sink; per-provider
+    overrides from ``TTS_OVERLAP_SECONDS`` are no longer honoured and providers
     return ``None`` from :meth:`TTSBase.get_overlap_seconds`.  The warning is
     emitted *lazily*, the first time that accessor is called (typically from
     ``audio.py`` while scheduling a sentence), so a legacy
@@ -19,12 +20,13 @@ def warn_overlap_deprecated() -> None:
 
     Playback behaviour therefore *does* change for providers that used to have
     an override, and ``TTS_OVERLAP_SECONDS`` is now dead configuration.  The
-    legacy per-file path keeps applying ``config.OVERLAP_SECONDS`` (default
-    ``0.5``, overridable with ``--over``), scaled down as the playback speed
-    approaches ``3.0x``; a provider that previously lowered or raised the
-    overlap through ``TTS_OVERLAP_SECONDS`` silently falls through to that
-    global default.  Concretely, Kokoro's ``0.6`` entry no longer applies and
-    it now crossfades at ``0.5`` — a small, accepted regression until gapless
+    legacy per-file path is strictly serial and applies **no** overlap at all:
+    ``config.OVERLAP_SECONDS`` is only a deprecated alias of
+    ``SENTENCE_GAP_SECONDS`` (``0.0``) and is not read by the player, and
+    ``--over`` is still accepted but ignored with a warning.  A provider that
+    previously lowered or raised the overlap through ``TTS_OVERLAP_SECONDS``
+    silently falls through to that zero default.  Concretely, Kokoro's ``0.6``
+    entry no longer applies — a small, accepted regression until gapless
     playback (spec-v3, see the gapless-persistent-sink PR) takes over overlap
     scheduling entirely.
     """
@@ -33,10 +35,10 @@ def warn_overlap_deprecated() -> None:
         return
     _overlap_warned = True
     logging.getLogger(__name__).warning(
-        "Per-provider audio overlap/crossfade has been removed (spec-v3 §9.1); "
-        "get_overlap_seconds() now returns None, so TTS_OVERLAP_SECONDS entries "
-        "are ignored (Kokoro's 0.6s falls through to 0.5s). The legacy per-file "
-        "playback path still uses config.OVERLAP_SECONDS (default 0.5s, see --over)."
+        "Per-sentence audio overlap/crossfade has been removed (gapless persistent "
+        "sink); get_overlap_seconds() now returns None, so TTS_OVERLAP_SECONDS "
+        "entries are ignored. The legacy per-file playback path still uses "
+        "config.OVERLAP_SECONDS (see --over)."
     )
 
 
@@ -213,11 +215,14 @@ class TTSBase(ABC):
 
     def get_overlap_seconds(self) -> float | None:
         """
-        Deprecated: provider-specific crossfade/overlap overrides are ignored (spec-v3 §9.1).
+        Deprecated: per-sentence crossfade/overlap was removed (spec-v3 §9.1).
 
-        Returns ``None`` for backward compatibility with the legacy per-file
-        audio path, which then keeps using ``config.OVERLAP_SECONDS`` (default
-        ``0.5``) between sentences.
+        The gapless persistent sink concatenates decoded PCM, so no overlap is
+        applied.  Provider-specific ``TTS_OVERLAP_SECONDS`` overrides are no
+        longer honoured either.  This method is kept only for backward
+        compatibility with the legacy per-file audio path and always returns
+        ``None``; that path then keeps using ``config.OVERLAP_SECONDS`` between
+        sentences.
         """
         warn_overlap_deprecated()
         return None

@@ -28,13 +28,10 @@ TTS_LANGUAGE_CODES = {
 }
 
 # TTS model-specific seconds of overlap between sentences.
-# DEPRECATED / DEAD since spec-v3 §9.1: providers return None from
-# get_overlap_seconds(), so these values are ignored.  Overlap is governed by
-# OVERLAP_SECONDS below (and, once gapless playback lands, by the gapless
-# scheduler).  Kokoro's entry is kept only so the old config shape still loads.
-TTS_OVERLAP_SECONDS = {
-    "kokoro": 0.6,
-}
+# DEPRECATED (spec-v3 §9.1): crossfade/overlap was removed in favour of a gapless
+# persistent sink. The mapping is kept as an empty dict for config compatibility
+# only; its values are ignored and `get_overlap_seconds()` now returns ``None``.
+TTS_OVERLAP_SECONDS = {}
 
 # ── Free TTS providers (no API key required) ───────────────────────────────
 
@@ -147,8 +144,75 @@ CAPCUT_TTS_WARMUP = os.environ.get("LUE_CAPCUT_TTS_WARMUP", "false").strip().low
 # Audio processing settings
 AUDIO_DATA_DIR = user_cache_dir("lue")
 os.makedirs(AUDIO_DATA_DIR, exist_ok=True)
+# Legacy per-file buffers (only used on the ``--legacy-audio`` path).
 AUDIO_BUFFERS = [os.path.join(AUDIO_DATA_DIR, f"buffer_{i}") for i in range(6)]
-MAX_QUEUE_SIZE = 12
+MAX_QUEUE_SIZE = 12  # legacy player queue bound (items)
+
+# ── Persistent sink (spec-v3 §11) ──────────────────────────────────────────
+AUDIO_SINK_RATE = 48000
+AUDIO_SINK_CHANNELS = 2
+AUDIO_SINK_SAMPLE_FMT = "s16le"
+BYTES_PER_SEC = AUDIO_SINK_RATE * 2 * AUDIO_SINK_CHANNELS  # 192000
+SINK_PRIME_MS = 150  # buffering watermark ONLY; no sleep (§4.5)
+SINK_DEVICE_LATENCY_MS = 100
+# Defensive parse: a malformed LUE_SINK_LEAD_MS must not break import.
+try:
+    SINK_LEAD_MS = int(os.environ.get("LUE_SINK_LEAD_MS", "250"))
+except (TypeError, ValueError):
+    logging.getLogger(__name__).warning(
+        "Invalid LUE_SINK_LEAD_MS=%r; falling back to 250.",
+        os.environ.get("LUE_SINK_LEAD_MS"),
+    )
+    SINK_LEAD_MS = 250
+SINK_LEAD_MS = max(SINK_LEAD_MS, 0)
+SINK_LEAD = SINK_LEAD_MS / 1000.0
+SINK_WRITE_TIMEOUT_S = 5.0
+SINK_TERM_TIMEOUT_S = 0.5
+SINK_KILL_TIMEOUT_S = 0.2
+SINK_EOF_TIMEOUT_S = 3.0
+SINK_STARTUP_GRACE_S = 0.1  # health-check delay after ffplay spawn (§3.1)
+# Restart budget (§5.7): a sink that dies before EOF is restarted, but a
+# permanent ffmpeg/device fault must not loop kill→restart forever — every
+# generation re-runs TTS.  Give up after N restarts inside the window and fail
+# open to the legacy per-file pipeline; back off exponentially in between.
+SINK_RESTART_MAX = 3
+SINK_RESTART_WINDOW_S = 60.0
+SINK_RESTART_BACKOFF_S = 0.25
+SINK_RESTART_BACKOFF_MAX_S = 5.0
+WRITER_CHUNK_MS = 20  # 3840 B/chunk
+PCM_RING_MAX_MS = 2000  # 384000 B
+PCM_LOW_WATER_MS = 300
+UNDERRUN_PAD_MS = 100
+MAX_UNDERRUN_PAD_MS = 2000
+MAX_QUEUED_SENTENCES = 8
+DECODE_FAIL_SILENCE_MS = 500
+DECODE_TERM_TIMEOUT_S = 0.3
+TASK_CANCEL_TIMEOUT_S = 1.0
+
+# ── Speed (spec-v3 §6.3) ───────────────────────────────────────────────────
+SPEED_MIN = 0.5
+SPEED_MAX = 4.0
+SPEED_STEP = 0.1
+DEFAULT_SPEED = 1.0
+
+# ── Sentences / overlap (P1-1) ─────────────────────────────────────────────
+SENTENCE_GAP_SECONDS = 0.0
+OVERLAP_SECONDS = 0.0  # DEPRECATED alias; kept for config compat
+
+# ── Temp lifecycle (P1-4) ──────────────────────────────────────────────────
+AUDIO_TMP_ROOT = user_cache_dir("lue")
+AUDIO_TMP_MAX_AGE_S = 3600
+
+# ── Migration flag (P1-5) ──────────────────────────────────────────────────
+USE_PERSISTENT_SINK = os.environ.get("LUE_PERSISTENT_SINK", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+
+# ── Optional conservative silence trimming (P1-4 / §7.3) ───────────────────
+TRIM_SILENCE = False
 
 # Pre-buffering settings (controls when playback starts)
 # Playback begins once either threshold is reached
@@ -266,8 +330,6 @@ SPEECHIFY_TTS_RETRY_BASE_DELAY = max(_spc_delay_raw, 0.1) if _spc_delay_raw > 0 
 
 # TTS pipeline UI settings
 SHOW_BUFFER_STATUS = os.environ.get("LUE_SHOW_BUFFER_STATUS", "").lower() in ("1", "true", "yes")
-
-OVERLAP_SECONDS = 0.5  # Seconds of overlap between sentences
 
 # Progress tracking settings
 PROGRESS_FILE_DIR = user_data_dir("lue")

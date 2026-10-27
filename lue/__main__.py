@@ -166,7 +166,23 @@ async def main():
     )
     
     parser.add_argument(
-        "-o", "--over", type=float, help="Seconds of overlap between sentences"
+        "-o", "--over", type=float,
+        help="DEPRECATED (ignored): seconds of overlap between sentences"
+    )
+
+    parser.add_argument(
+        "--legacy-audio",
+        action="store_true",
+        help="Use the legacy per-file audio pipeline instead of the persistent sink",
+    )
+
+    parser.add_argument(
+        "--trim-silence",
+        action="store_true",
+        help=(
+            "Conservatively trim leading/trailing silence during decode "
+            "(persistent sink only; no effect with --legacy-audio)"
+        ),
     )
     
     parser.add_argument(
@@ -214,6 +230,18 @@ async def main():
     # Initialize console early for printing messages
     console = Console()
 
+    # Validate --speed before doing anything else (spec-v3 §6.2): argparse
+    # already coerces the value (and itself exits 2 on a non-numeric string);
+    # here we range-check it.  This runs before file/guide handling so the
+    # error is deterministic.
+    if getattr(args, 'speed', None) is not None:
+        if not (config.SPEED_MIN <= args.speed <= config.SPEED_MAX):
+            console.print(
+                f"[bold red]Error: --speed must be between "
+                f"{config.SPEED_MIN} and {config.SPEED_MAX}.[/bold red]"
+            )
+            sys.exit(2)
+
     # Handle guide argument - open guide file in Lue app
     if args.guide:
         guide_path = get_guide_file_path()
@@ -239,7 +267,24 @@ async def main():
         args.file_path = os.path.abspath(args.file_path)
 
     if args.over is not None:
-        config.OVERLAP_SECONDS = args.over
+        # DEPRECATED (spec-v3 §9.1/§12): the crossfade was removed.  argparse
+        # has already coerced the value to float (and errors on non-numeric);
+        # we deliberately discard it and warn once.
+        console.print(
+            "[yellow]Warning: crossfade removed; --over ignored.[/yellow]"
+        )
+
+    if args.legacy_audio:
+        config.USE_PERSISTENT_SINK = False
+    if args.trim_silence:
+        config.TRIM_SILENCE = True
+        if not config.USE_PERSISTENT_SINK:
+            # Decode-time silenceremove (§7.3) only exists in the sink decode
+            # chain; the legacy pipeline would silently ignore the flag.
+            console.print(
+                "[yellow]Warning: --trim-silence only applies to the "
+                "persistent sink; ignored with --legacy-audio.[/yellow]"
+            )
 
     if args.mode is not None:
         config.UI_MODE = args.mode
@@ -307,7 +352,7 @@ async def main():
         lang = args.lang if hasattr(args, 'lang') else None
         tts_instance = tts_manager.create_model(args.tts, console, voice=voice, lang=lang)
 
-    reader = Lue(args.file_path, tts_model=tts_instance, overlap=args.over)
+    reader = Lue(args.file_path, tts_model=tts_instance)
     if hasattr(args, 'speed'):
         reader.playback_speed = args.speed
         
@@ -354,8 +399,16 @@ def cli():
     """Synchronous entry point for the command-line interface."""
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except SystemExit:
+        # argparse and the --speed range check exit via SystemExit(2).  The
+        # console-script wrapper must propagate that status instead of
+        # swallowing it (otherwise invalid CLI input looks like success).
+        raise
+    except KeyboardInterrupt:
+        # Ctrl-C is a normal user exit: no traceback and no "fatal error" log.
+        # 130 is the shell convention for a SIGINT-terminated process; the
+        # terminal state was already restored by main()'s finally block.
+        raise SystemExit(130) from None
     except Exception as e:
         logging.critical(f"Fatal error in application startup: {e}", exc_info=True)
 
